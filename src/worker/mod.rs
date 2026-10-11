@@ -10,7 +10,7 @@ use crate::types::{CppArtifacts, FsNode, Lang, WorkerOut, WorkerStart};
 
 mod debuggee;
 pub(crate) mod execution;
-mod host_device;
+pub(crate) mod host_device;
 mod io;
 mod runtime;
 
@@ -180,9 +180,9 @@ async fn start(msg: WorkerStart) {
     if msg.lang != Lang::C && (msg.cpp_artifacts.is_some() || !msg.binary_files.is_empty()) {
         return WorkerOut::Error { message: "Binary build inputs require C/C++".into() }.send();
     }
-    if msg.host_device.is_some() && msg.lang != Lang::C {
+    if msg.host_device.is_some() && !matches!(msg.lang, Lang::C | Lang::Python) {
         return WorkerOut::Error {
-            message: "Host devices are supported only for C/C++ execution".into(),
+            message: "Host devices are supported only for C/C++ and Python execution".into(),
         }
         .send();
     }

@@ -5,6 +5,7 @@ use wasmer_wasix::virtual_fs::{AsyncWriteExt, FileSystem, mem_fs};
 
 use crate::types::{FsNode, WorkerOut, WorkerStart};
 use crate::worker::execution::Execution;
+use crate::worker::host_device::{HOST_DEVICE_PATH, HostDeviceFile};
 use crate::worker::stop;
 
 use debuggee::PythonDebuggee;
@@ -37,6 +38,11 @@ pub async fn start(msg: WorkerStart) {
 }
 
 async fn run(msg: WorkerStart, build_start: Instant) -> Result<WorkerOut<'static>, String> {
+    let host_device = msg
+        .host_device
+        .map(HostDeviceFile::new)
+        .transpose()
+        .map_err(|e| format!("Invalid host device: {e}"))?;
     let fs = crate::worker::create_user_fs(FsNode::Dir(msg.fs))
         .await
         .map_err(|e| format!("Failed to prepare the filesystem: {e}"))?;
@@ -61,6 +67,9 @@ async fn run(msg: WorkerStart, build_start: Instant) -> Result<WorkerOut<'static
 
     if let Some(debuggee) = debuggee {
         step = step.device_file("/__debug__", Box::new(debuggee.debug_file()));
+    }
+    if let Some(device) = host_device {
+        step = step.device_file(HOST_DEVICE_PATH, Box::new(device));
     }
 
     let run_start = Instant::now();
