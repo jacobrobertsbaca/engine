@@ -52,6 +52,27 @@ An optional first argument selects the public `dist/debugger-sh.js` from an unpa
 The test covers empty reads without input, sequential Python input, C++ input and stopping a
 blocked read before rerunning. It starts an isolated loopback server and closes its browser.
 
+## Upstream coverage
+
+The cumulative source includes the five changes proposed upstream as of 2026-10-10:
+
+- [#18](https://github.com/debugger-sh/engine/pull/18): stale DWARF file indices.
+- [#19](https://github.com/debugger-sh/engine/pull/19): C/C++ and Python host byte device.
+- [#20](https://github.com/debugger-sh/engine/pull/20): C++ source exceptions and debugger unwinding.
+- [#21](https://github.com/debugger-sh/engine/pull/21): zero-length stdin reads.
+- [#22](https://github.com/debugger-sh/engine/pull/22): precompiled C++ headers, archives, and source selection.
+
+These PRs are based on upstream `cc250508fabb5b091075e073ceb2e14899fd8423`.
+Their combined engine source, preserving both sides of the overlapping host-device
+and compiler-input changes, matches this fork's `src/` tree. Fork package versions,
+repository/download URLs, and release instructions remain specific to this fork.
+Acceptance, merge order, and any later upstream edits still require comparison
+against the actual merged source before switching a consumer to upstream.
+
+This synchronization does not replace the already-published
+`0.3.15-webide.0.7.3.1` release or its immutable source tag (`cf7fcdd`). A future
+fork artifact needs a new version and its own build, test, and integrity evidence.
+
 ## Notices
 
 `assets/cpp-exceptions/runtime.tar.gz` ships verbatim and carries the upstream LLVM

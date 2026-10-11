@@ -151,12 +151,11 @@ impl Debugger {
                 name: die.qualified_name().unwrap_or(String::new()),
                 line: loc.as_ref().map_or(0, |l| l.line as u32),
                 column: loc.as_ref().map_or(0, |l| l.column as u32),
-                source: loc.as_ref().map(|l| {
+                source: loc.as_ref().and_then(|l| {
                     self.info
                         .dwarf
                         .file_at(l.file_index)
-                        .to_string_lossy()
-                        .into_owned()
+                        .map(|p| p.to_string_lossy().into_owned())
                 }),
             });
             pos += func.size as u32;
@@ -192,7 +191,7 @@ impl Debugger {
             .filter(|l| {
                 let file = self.info.dwarf.file_at(l.1.file_index);
                 let loc_line = l.1.line as i64;
-                *file == target && loc_line >= line
+                file.map_or(false, |f| *f == target) && loc_line >= line
             })
             .min_by(|l1, l2| {
                 l1.1.line

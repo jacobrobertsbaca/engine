@@ -62,6 +62,8 @@ notices and payload provenance are in `share/licenses/cpp-exceptions/` inside
 const engine = await Engine.create('c'); // 'c' | 'python'
 
 engine.fs; // DirNode  — virtual filesystem, set before run()
+engine.binaryFiles; // Record<string, Uint8Array> — optional C/C++ binary files
+engine.cppArtifacts; // Optional selected sources, archives, and precompiled header
 engine.stdout; // Stdout   — .on('data', (chunk: Uint8Array) => …) / .off(...)
 engine.stderr; // Stdout
 engine.stdin; // Stdin    — .write(string | Uint8Array): Promise<void>
@@ -81,6 +83,39 @@ engine.debugger.filterInternals = true;
 ```
 
 See [Presentation filtering (Python)](./docs/integration.md#presentation-filtering-python) in the integration guide for stack `presentationHint`, frame naming (`__main__` vs `main`), and dunder local filtering.
+
+---
+
+## Precompiled C++ inputs
+
+Set `binaryFiles` to bytes keyed by absolute virtual paths. Set `cppArtifacts`
+to select source files, link archives, or use a precompiled header:
+
+```ts
+engine.binaryFiles = { '/support.a': archiveBytes, '/headers.pch': headerBytes };
+engine.cppArtifacts = {
+  sources: ['/main.cpp'],
+  archives: ['/support.a'],
+  precompiledHeader: '/headers.pch'
+};
+```
+
+All fields are optional. Without `sources`, the engine compiles every source in
+`engine.fs`. Selected sources must exist and cannot be empty; archive and PCH
+paths must have matching bytes in `binaryFiles`. Binary paths must be absolute,
+cannot contain empty, `.` or `..` components, and cannot replace existing files.
+The engine snapshots the binary bytes and artifact options when a run starts.
+Clear them before reusing an engine for an ordinary source-only run.
+
+Build artifacts with the same compiler, sysroot, and flags as the engine. A PCH
+also needs its original header files at their original virtual paths. These
+inputs work in Run and Debug for C/C++ only; Python and Rust reject them.
+
+After building, run the browser regression with an existing Playwright installation:
+
+```bash
+PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs node tools/cpp-artifacts/run.mjs --exceptions
+```
 
 ---
 
@@ -125,6 +160,17 @@ npm install
 npm run build   # wasm-pack build --target web && vite build
 npm run dev     # local development
 ```
+
+After building, run the stdin browser regression checks with an installed Playwright
+module and Chromium browser:
+
+```bash
+PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs node tools/stdin/run.mjs
+```
+
+The checks cover an empty read without input, sequential Python input across reruns,
+stopping blocked input, and C++ input. Pass a built or unpacked release's
+`dist/debugger-sh.js` as the first argument to test that artifact.
 
 To test against the reference IDE, clone [debugger-sh/debugger.sh](https://github.com/debugger-sh/debugger.sh) alongside this repo and link:
 

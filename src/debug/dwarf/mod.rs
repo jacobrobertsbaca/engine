@@ -93,15 +93,14 @@ impl Dwarf {
     }
 
     /// Gets the path for the file with the given index.
-    pub fn file_at(&self, index: usize) -> &PathBuf {
-        self.units
-            .iter()
-            .find_map(|u| {
-                u.file_at({
-                    let local_index = index.checked_sub(u.properties().file_offset)?;
-                    local_index
-                })
-            })
-            .expect("Valid file index")
+    /// Returns [None] if the index does not resolve to any unit's file table.
+    /// This happens when `wasm-ld` deduplicates COMDAT sections: the dropped
+    /// translation units' DWARF survives in the output but their file tables
+    /// do not, leaving stale indices behind.
+    pub fn file_at(&self, index: usize) -> Option<&PathBuf> {
+        self.units.iter().find_map(|u| {
+            let local_index = index.checked_sub(u.properties().file_offset)?;
+            u.file_at(local_index)
+        })
     }
 }
