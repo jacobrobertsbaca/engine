@@ -1,0 +1,235 @@
+// Empty values stay distinct from invalid data; large native work fails explicitly.
+{
+  "steps": [
+    {
+      "type": "request",
+      "command": "setBreakpoints",
+      "arguments": {
+        "source": {
+          "path": "main.cpp"
+        },
+        "breakpoints": [
+          {
+            "line": 22
+          }
+        ]
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "breakpoints": {
+          "$array.contains": [
+            {
+              "line": 22,
+              "verified": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "request",
+      "command": "configurationDone",
+      "arguments": {}
+    },
+    {
+      "type": "event",
+      "event": "stopped",
+      "$timeout": 30000
+    },
+    {
+      "type": "request",
+      "command": "stackTrace",
+      "arguments": {
+        "threadId": 1
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "stackFrames": {
+          "$array.contains": [
+            {
+              "name": "main",
+              "id": "${{frame}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "request",
+      "command": "scopes",
+      "arguments": {
+        "frameId": "{{frame}}"
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "scopes": {
+          "$array.contains": [
+            {
+              "name": "Locals",
+              "variablesReference": "${{locals}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{locals}}"
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": "${{values}}"
+      }
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'empty').indexedVariables",
+      "expect": 0
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'packed').namedVariables > 0 && !values.find(v => v.name === 'packed').value.startsWith('<error:')",
+      "expect": true
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'packed').variablesReference}}",
+        "filter": "named",
+        "start": 0,
+        "count": 100
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": {
+          "$array.contains": [{ "name": "__size_", "value": "3" }]
+        }
+      }
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'unreadable').value.startsWith('<error:')",
+      "expect": true
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'corrupt').value.startsWith('<error:')",
+      "expect": true
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'corruptMap').value.startsWith('<error:')",
+      "expect": true
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'oversized').value.startsWith('<error:')",
+      "expect": true
+    },
+    {
+      "type": "expect",
+      "run": "'indexedVariables' in values.find(v => v.name === 'unreadable')",
+      "expect": false
+    },
+    {
+      "type": "expect",
+      "run": "'indexedVariables' in values.find(v => v.name === 'corrupt')",
+      "expect": false
+    },
+    {
+      "type": "expect",
+      "run": "'indexedVariables' in values.find(v => v.name === 'corruptMap')",
+      "expect": false
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'invalid').value",
+      "expect": "0xfffffff0"
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'invalid').variablesReference}}"
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "value": "<unavailable>"
+          }
+        ]
+      }
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'many').indexedVariables",
+      "expect": 10002
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'many').variablesReference}}",
+        "start": 10000,
+        "count": 1
+      }
+    },
+    {
+      "type": "response",
+      "success": false
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'many').variablesReference}}",
+        "filter": "indexed",
+        "start": 10002,
+        "count": 100
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": { "variables": [] }
+    },
+    {
+      "type": "request",
+      "command": "continue",
+      "arguments": {
+        "threadId": 1
+      }
+    },
+    {
+      "type": "event",
+      "event": "runResult",
+      "body": {
+        "type": "completed",
+        "exitCode": 0
+      },
+      "$timeout": 10000
+    }
+  ]
+}

@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use crate::debug::formatters::default::StructureFormatter;
 use crate::debug::formatters::{ChildCounts, VariableFormatter};
@@ -41,16 +41,13 @@ impl StdVectorFormatter {
             .byte_size()
             .context("std::vector element size is unavailable")? as usize;
 
-        if elem_size == 0 {
-            return Ok(VectorData {
-                begin: begin.clone(),
-                count: 0,
-                elem_ty,
-                elem_size: 0,
-            });
-        }
-
-        let bytes = u64::from(end_addr).saturating_sub(u64::from(begin_addr));
+        let bytes = u64::from(end_addr)
+            .checked_sub(u64::from(begin_addr))
+            .context("std::vector end precedes begin")?;
+        ensure!(elem_size > 0 && bytes % elem_size as u64 == 0, "Invalid std::vector element range");
+        ensure!(u64::from(end_addr) <= value.debugger().context("no debugger")?.memory().byte_size() as u64,
+            "std::vector storage is outside memory");
+        ensure!(bytes == 0 || !begin_addr.is_null(), "std::vector storage is null");
         Ok(VectorData {
             begin: begin.clone(),
             count: bytes as usize / elem_size,
@@ -62,7 +59,7 @@ impl StdVectorFormatter {
 
 impl VariableFormatter for StdVectorFormatter {
     fn matches(&self, ty: &Type) -> bool {
-        ty.matches("^std::vector<.+>$")
+        ty.matches("^std::vector<.+>$") && !ty.matches("^std::vector<bool[,>]")
     }
 
     fn display(&self, value: &Variable) -> Result<String> {
@@ -78,9 +75,7 @@ impl VariableFormatter for StdVectorFormatter {
         let data = Self::data(value)?;
         let start = range.start.min(data.count);
         let end = range.end.min(data.count);
-        if data.elem_size == 0 {
-            return Ok(Vec::new());
-        }
+        ensure!(end.saturating_sub(start) <= 10_000, "std::vector page exceeds 10000 elements");
 
         let mut result = Vec::with_capacity(end.saturating_sub(start));
         for i in start..end {

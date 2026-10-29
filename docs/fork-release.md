@@ -64,10 +64,17 @@ The cumulative source includes the five changes proposed upstream as of 2026-10-
 
 These PRs are based on upstream `cc250508fabb5b091075e073ceb2e14899fd8423`.
 Their combined engine source, preserving both sides of the overlapping host-device
-and compiler-input changes, matches this fork's `src/` tree. Fork package versions,
+and compiler-input changes, matches the fork's `src/` tree at `3f01766`. Fork package versions,
 repository/download URLs, and release instructions remain specific to this fork.
 Acceptance, merge order, and any later upstream edits still require comparison
 against the actual merged source before switching a consumer to upstream.
+
+The `0.3.15-webide.0.8.0.1` candidate also includes
+[#23](https://github.com/debugger-sh/engine/pull/23): bounded native container reads,
+truthful unavailable values, and paged libc++ deque children. Its two source commits
+apply unchanged to the same upstream base. Applying the earlier cumulative source
+and runtime-asset changes to that upstream feature branch reproduces this fork's
+`src/` and `assets/` trees exactly. Candidate preparation does not publish a release.
 
 This synchronization does not replace the already-published
 `0.3.15-webide.0.7.3.1` release or its immutable source tag (`cf7fcdd`). A future

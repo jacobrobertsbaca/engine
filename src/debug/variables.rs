@@ -154,7 +154,12 @@ impl Variable {
         let piece = self.pieces.first()?;
         let mut bytes = match &piece.location {
             gimli::Location::Address { address } => {
-                self.debugger()?.memory().read((*address).into(), len)
+                let memory = self.debugger()?.memory();
+                let end = usize::try_from(*address).ok()?.checked_add(len)?;
+                if end > memory.byte_size() {
+                    return None;
+                }
+                memory.read((*address).into(), len)
             }
             gimli::Location::Value { value } => value_to_le_bytes(*value, len),
             gimli::Location::Bytes { value } => value.to_slice().ok()?.to_vec(),
