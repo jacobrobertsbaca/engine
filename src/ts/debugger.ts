@@ -3,7 +3,7 @@ import EventEmitter from 'events';
 /* eslint-disable-next-line @typescript-eslint/no-unused-vars */
 import { type Engine } from '.';
 import { DapAdapter, WorkerOut } from '../../pkg/engine';
-import { Internals } from './util';
+import { Internals } from './util.js';
 
 type DebuggerEventMap = {
   event: [unknown];

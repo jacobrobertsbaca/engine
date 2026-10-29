@@ -1,4 +1,4 @@
-import { type RunResult } from '.';
+import { type RunResult } from './index.js';
 
 /**
  * An exported symbol that allows us to define properties
