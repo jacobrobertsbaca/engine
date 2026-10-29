@@ -71,6 +71,8 @@ export async function createEngineBackend(opts: BackendOptions): Promise<Backend
           /* swallow; reported as test failure if needed */
         }
       );
+      // Some scenarios intentionally finish while the guest is still paused.
+      await engine.dispose();
       await Promise.all(artifactTasks);
     }
   };
