@@ -1,4 +1,3 @@
-/// <reference types="node" preserve="true" />
 import EventEmitter from 'events';
 
 import { prefetch_urls, WorkerOut, WorkerStart } from '../../pkg/engine';
