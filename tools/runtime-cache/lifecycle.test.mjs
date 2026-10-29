@@ -139,6 +139,29 @@ test('creation owns options before asynchronous initialization', async () => {
   await engine.dispose();
 });
 
+test('binary snapshots own Buffer and subclass bytes before worker readiness', async () => {
+  class ViewBytes extends Uint8Array {
+    slice() {
+      return this.subarray();
+    }
+  }
+  const engine = await Engine.create('c', options());
+  const buffer = Buffer.from([1, 2]);
+  const subclass = new ViewBytes([3, 4]);
+  engine.binaryFiles = { '/buffer.bin': buffer, '/subclass.bin': subclass };
+  const job = engine.compile();
+  const worker = workers.at(-1);
+  buffer[0] = 9;
+  subclass[0] = 9;
+  worker.emit({ type: 'ready' });
+  const start = worker.messages.at(-1);
+  assert.deepEqual([...start.binary_files['/buffer.bin']], [1, 2]);
+  assert.deepEqual([...start.binary_files['/subclass.bin']], [3, 4]);
+  complete(worker);
+  await job;
+  await engine.dispose();
+});
+
 test('Debug immediately releases a retained Module and never transports its seed', async () => {
   const engine = await Engine.create('c', options({ cacheCompilerModule: true }));
   engine.debugger.enabled = false;

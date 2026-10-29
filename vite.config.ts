@@ -6,7 +6,16 @@ import dts from 'vite-plugin-dts';
 const outDir = 'dist';
 
 export default defineConfig({
-  plugins: [wasm(), dts()],
+  plugins: [
+    wasm(),
+    dts({
+      beforeWriteFile(filePath, content) {
+        // Public EventEmitter types also work when consumers exclude ambient types.
+        if (/from ['"]events['"]/.test(content))
+          return { filePath, content: `/// <reference types="node" />\n${content}` };
+      }
+    })
+  ],
   worker: {
     format: 'es',
     plugins: () => [wasm()]

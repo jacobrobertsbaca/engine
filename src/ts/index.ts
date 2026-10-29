@@ -7,12 +7,12 @@ import type {
   CompilerModuleMessage,
   CompilerModuleStats,
   RetainedCompilerModule
-} from './compiler-module-cache';
-import { CppCacheLimits, CppObjectCache, ObjectCacheStats } from './cpp-object-cache';
-import { Debugger } from './debugger';
+} from './compiler-module-cache.js';
+import { CppCacheLimits, CppObjectCache, ObjectCacheStats } from './cpp-object-cache.js';
+import { Debugger } from './debugger.js';
 import { createEngineWorker } from './engine-worker';
-import { HostDeviceOpener, HostDeviceSession } from './host-device';
-import { errorResult, Internals } from './util';
+import { HostDeviceOpener, HostDeviceSession } from './host-device.js';
+import { errorResult, Internals } from './util.js';
 
 let initialization: ReturnType<typeof init> | undefined;
 export type Lang = 'c' | 'python' | 'rust';
@@ -40,7 +40,7 @@ export interface CppPerformanceOptions {
 export interface EngineOptions {
   cpp?: CppPerformanceOptions;
 }
-export type { CppCacheLimits, ObjectCacheStats } from './cpp-object-cache';
+export type { CppCacheLimits, ObjectCacheStats } from './cpp-object-cache.js';
 
 export type Timing = { totalMs: number; buildMs: number; runMs: number };
 export type CompletedResult = { type: 'completed'; exitCode: number; timing: Timing };
@@ -210,7 +210,7 @@ export class Engine {
       snapshot = {
         fs: structuredClone(this.fs),
         binary_files: Object.fromEntries(
-          Object.entries(this.binaryFiles).map(([path, bytes]) => [path, bytes.slice()])
+          Object.entries(this.binaryFiles).map(([path, bytes]) => [path, new Uint8Array(bytes)])
         ),
         cpp_artifacts: structuredClone(this.cppArtifacts) ?? null
       };
@@ -538,6 +538,6 @@ export class Stdin {
   }
 }
 
-export * from './debugger';
-export { HOST_DEVICE_PATH } from './host-device';
-export type { HostDevice, HostDeviceOpener } from './host-device';
+export * from './debugger.js';
+export { HOST_DEVICE_PATH } from './host-device.js';
+export type { HostDevice, HostDeviceOpener } from './host-device.js';
