@@ -67,17 +67,18 @@ impl DwarfBackend {
     }
 
     fn variable_response(&mut self, var: &Variable) -> Result<Value> {
-        let counts = var.num_children().unwrap_or_default();
+        let result = var.num_children();
+        let counts_available = result.is_ok();
+        let display = match &result {
+            Err(e) => format!("<error: {e}>"),
+            Ok(_) => var.display().unwrap_or_else(|e| format!("<error: {e}>")),
+        };
+        let counts = result.unwrap_or_default();
         let sub_ref = if counts.is_empty() {
             0
         } else {
             self.vars
                 .allocate(DwarfRef::Variable { var: var.clone(), counts: counts.clone() })
-        };
-
-        let display = match var.display() {
-            Ok(s) => s,
-            Err(e) => format!("<error: {e}>"),
         };
 
         let mut value = json!({
@@ -88,10 +89,8 @@ impl DwarfBackend {
         });
 
         if let Some(map) = value.as_object_mut() {
-            if counts.indexed > 0 {
+            if counts_available {
                 map.insert("indexedVariables".into(), counts.indexed.into());
-            }
-            if counts.named > 0 {
                 map.insert("namedVariables".into(), counts.named.into());
             }
             if let Some(addr) = var.address() {

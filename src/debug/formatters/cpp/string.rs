@@ -62,6 +62,8 @@ impl StdStringFormatter {
                 }
             }
             let buf = inline.address().context("__s.__data_ address")?;
+            anyhow::ensure!(u64::from(buf) + len as u64 <= dbg.memory().byte_size() as u64,
+                "std::string storage is outside memory");
             return Ok(dbg.memory().read(buf, len));
         }
 
@@ -74,6 +76,10 @@ impl StdStringFormatter {
             .child_with_name("__size_")
             .and_then(|f| f.unsigned_value())
             .context("__l.__size_")? as usize;
+        anyhow::ensure!(len <= 65_536, "std::string display exceeds 65536 bytes");
+        anyhow::ensure!(len == 0 || !data.is_null(), "std::string storage is null");
+        anyhow::ensure!(u64::from(data) + len as u64 <= dbg.memory().byte_size() as u64,
+            "std::string storage is outside memory");
         Ok(dbg.memory().read(data, len))
     }
 }

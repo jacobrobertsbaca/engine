@@ -96,6 +96,7 @@ struct TreeIterator {
     current: MapEntry,
     value_type: Type,
     size: usize,
+    remaining_steps: usize,
 }
 
 impl TreeIterator {
@@ -119,11 +120,14 @@ impl TreeIterator {
             .context("No child named '__size_'")?
             .unsigned_value()
             .context("Could not read __size_")? as usize;
+        anyhow::ensure!(size <= container.debugger().context("no debugger")?.memory().byte_size() / 16,
+            "Invalid std::map size");
 
         Ok(Self {
             current: MapEntry(begin_node),
             value_type,
             size,
+            remaining_steps: 10_000,
         })
     }
 
@@ -137,54 +141,57 @@ impl TreeIterator {
         self.current.0.child_at_offset(16)
     }
 
-    fn next(&mut self) {
+    fn next(&mut self) -> Result<()> {
+        self.remaining_steps = self.remaining_steps.checked_sub(1)
+            .context("std::map traversal exceeds 10000 steps")?;
         if self.current.null() {
-            return;
+            return Ok(());
         }
 
         let right = self.current.right();
 
         if let Some(right) = right {
             if !right.null() {
-                self.current = self.tree_min(&right);
-                return;
+                self.current = self.tree_min(&right)?;
+                return Ok(());
             }
         }
 
         let mut steps = 0;
         while !self.current.is_left_child() {
             let Some(parent) = self.current.parent() else {
-                return;
+                return Ok(());
             };
             self.current = parent;
             steps += 1;
-            if steps > self.size {
-                return;
-            }
+            self.remaining_steps = self.remaining_steps.checked_sub(1)
+                .context("std::map traversal exceeds 10000 steps")?;
+            anyhow::ensure!(steps <= self.size, "Invalid std::map parent cycle");
         }
 
         if let Some(parent) = self.current.parent() {
             self.current = parent;
         }
+        Ok(())
     }
 
-    fn tree_min(&self, entry: &MapEntry) -> MapEntry {
+    fn tree_min(&mut self, entry: &MapEntry) -> Result<MapEntry> {
         let mut curr = entry.clone();
 
         if entry.null() {
-            return curr;
+            return Ok(curr);
         }
 
         let mut steps = 0;
         while let Some(left) = curr.left().filter(|e| !e.null()) {
             curr = left;
             steps += 1;
-            if steps > self.size {
-                break;
-            }
+            self.remaining_steps = self.remaining_steps.checked_sub(1)
+                .context("std::map traversal exceeds 10000 steps")?;
+            anyhow::ensure!(steps <= self.size, "Invalid std::map child cycle");
         }
 
-        curr
+        Ok(curr)
     }
 }
 
@@ -211,19 +218,23 @@ impl VariableFormatter for StdMapFormatter {
     fn indexed_children(&self, value: &Variable, range: Range<usize>) -> Result<Vec<Variable>> {
         let mut iter = TreeIterator::new(value)?;
         let end = range.end.min(iter.size);
-        for _ in 0..range.start {
-            iter.next();
+        if range.start >= end {
+            return Ok(Vec::new());
         }
-        Ok((range.start..end)
+        anyhow::ensure!(end <= 10_000, "std::map traversal exceeds 10000 entries");
+        for _ in 0..range.start {
+            iter.next()?;
+        }
+        (range.start..end)
             .map(|i| {
                 let child = iter
                     .value()
                     .with_name(&format!("[{i}]"))
                     .with_type(&iter.value_type);
-                iter.next();
-                child
+                iter.next()?;
+                Ok(child)
             })
-            .collect())
+            .collect()
     }
 
     fn named_children(&self, _: &Variable, _: Range<usize>) -> Result<Vec<Variable>> {
