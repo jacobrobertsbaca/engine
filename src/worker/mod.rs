@@ -457,15 +457,27 @@ async fn start_cpp(
                     cache.bypass(source, reason); continue;
                 }
                 let mut volatile_dependency = false;
-                for dependency in cpp_cache::dependencies(depfile.as_ref().unwrap()).unwrap() {
+                let mut system_headers = Vec::new();
+                let mut user_headers = Vec::new();
+                for dependency in cpp_cache::dependencies(depfile.as_ref().unwrap()).unwrap().into_iter()
+                    .map(|path| cpp_cache::normalized_dependency(&path).expect("validated canonical dependency")) {
                     if inputs.as_ref().is_some_and(|inputs| !inputs.user_paths.contains(&dependency)) {
                         match exec.read_bytes(&dependency).await {
-                            Ok(bytes) if !cpp_cache::volatile_macro(&bytes) => (),
+                            Ok(bytes) if !cpp_cache::volatile_macro(&bytes) => system_headers.push(bytes),
+                            _ => { volatile_dependency = true; break; },
+                        }
+                    } else {
+                        match exec.read_bytes(&dependency).await {
+                            Ok(bytes) => user_headers.push(bytes),
                             _ => { volatile_dependency = true; break; },
                         }
                     }
                 }
                 if volatile_dependency { cache.bypass(source, "volatile-system-header"); continue; }
+                let Some(tainted) = cpp_cache::trusted_macro_taint(&system_headers) else { cache.bypass(source, "unsupported-system-macros"); continue; };
+                if user_headers.iter().any(|bytes| cpp_cache::references_tainted_macro(bytes, &tainted)) {
+                    cache.bypass(source, "dynamic-system-macro"); continue;
+                }
                 let Ok(object) = exec.read_bytes(&obj_path).await else { cache.bypass(source, "missing-object"); continue; };
                 let object_hash = cpp_cache::hash(&object);
                 if !cpp_cache::valid_object(&object, &object_hash) { cache.bypass(source, "invalid-object"); continue; }

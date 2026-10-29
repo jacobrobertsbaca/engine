@@ -17,6 +17,9 @@ const option = (name, fallback) => process.argv.find((arg) => arg.startsWith(`--
 const modulePath = resolve(option('module', fileURLToPath(new URL('../../dist/debugger-sh.js', import.meta.url))));
 const evidenceRoot = resolve(option('output', join(dirname(dirname(dirname(modulePath))), 'cs106b-runtime-cache-evidence')));
 const browserName = option('browser', 'chrome');
+const compileFixturePath = option('compile-fixture');
+const compileFixture = compileFixturePath ? JSON.parse(await readFile(resolve(compileFixturePath), 'utf8')) : undefined;
+const fixtureBinaries = compileFixture ? Object.entries(compileFixture.binaryFiles ?? {}).map(([path, bytes]) => [path, typeof bytes === 'string' ? Buffer.from(bytes, 'base64') : Buffer.from(bytes)]) : [];
 assert.ok(['chrome', 'chromium', 'webkit'].includes(browserName), 'Use chrome, chromium, or webkit; WebKit is not Safari');
 const sampleCount = Number(option('samples', '3'));
 assert.ok(Number.isInteger(sampleCount) && sampleCount >= 3, 'At least three counterbalanced samples are required');
@@ -30,7 +33,9 @@ const source = {
   diffSha256: digest(execFileSync('git', ['diff', 'HEAD', '--', 'src', 'Cargo.toml', 'Cargo.lock'], { cwd: sourceRoot })),
   status: execFileSync('git', ['status', '--short'], { cwd: sourceRoot, encoding: 'utf8' }).trim(),
   modulePath,
-  moduleSha256: digest(moduleBytes)
+  moduleSha256: digest(moduleBytes),
+  harnessSha256: digest(await readFile(fileURLToPath(import.meta.url))),
+  fixtureDefinitionsSha256: digest(await readFile(fileURLToPath(new URL('./fixtures.mjs', import.meta.url))))
 };
 const sourceFiles = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', 'src', 'Cargo.toml', 'Cargo.lock', 'package.json', 'package-lock.json', 'vite.config.ts'], { cwd: sourceRoot, encoding: 'utf8' }).trim().split('\n').filter(Boolean).sort();
 const fileManifest = await Promise.all(sourceFiles.map(async (path) => ({ path, sha256: digest(await readFile(join(sourceRoot, path))) })));
@@ -46,6 +51,10 @@ const canvas = document.querySelector('canvas');
 const context = canvas.getContext('2d');
 const memory = () => performance.memory ? { jsHeapUsedBytes: performance.memory.usedJSHeapSize, jsHeapTotalBytes: performance.memory.totalJSHeapSize, jsHeapLimitBytes: performance.memory.jsHeapSizeLimit } : null;
 window.probe = {
+  async loadFixtureBinaries(paths) {
+    this.fixtureBinaries = Object.fromEntries(await Promise.all(paths.map(async (path, index) => [path, new Uint8Array(await (await fetch('/fixture-binary/' + index)).arrayBuffer())])));
+    return Object.fromEntries(Object.entries(this.fixtureBinaries).map(([path, bytes]) => [path, bytes.length]));
+  },
   async measureMemory() {
     if (typeof performance.measureUserAgentSpecificMemory !== 'function') return { status: 'unavailable' };
     let timeout;
@@ -94,11 +103,11 @@ window.probe = {
     };
     return { creationMs: this.creationMs, memory: memory(), stats: this.engine.cacheStats };
   },
-  begin({ label, files, marker = '', compileOnly = false, binaryFiles = {}, artifacts }) {
+  begin({ label, files, marker = '', compileOnly = false, binaryFiles = {}, artifacts, useFixtureBinaries = false }) {
     this.state = { label, marker, active: true, done: false, stdout: '', stderr: '', started: performance.now(), firstMarkerMs: null, firstGraphicsBytesMs: null, drawFrameCallbackMs: null, deviceOpens: 0, deviceCleanups: 0, deviceBytes: 0, beforeMemory: memory() };
     context.clearRect(0, 0, canvas.width, canvas.height);
     this.engine.fs = structuredClone(files);
-    this.engine.binaryFiles = Object.fromEntries(Object.entries(binaryFiles).map(([path, bytes]) => [path, new Uint8Array(bytes)]));
+    this.engine.binaryFiles = Object.fromEntries(Object.entries(useFixtureBinaries ? this.fixtureBinaries : binaryFiles).map(([path, bytes]) => [path, new Uint8Array(bytes)]));
     this.engine.cppArtifacts = structuredClone(artifacts);
     document.querySelector('#label').textContent = label;
     this.state.preparationMs = performance.now() - this.state.started;
@@ -134,6 +143,10 @@ const server = createServer((request, response) => {
     response.setHeader('Content-Type', 'text/javascript'); response.end(moduleBytes);
   } else if (request.url === '/') {
     response.setHeader('Content-Type', 'text/html'); response.end(html);
+  } else if (request.url.startsWith('/fixture-binary/')) {
+    const bytes = fixtureBinaries[Number(request.url.slice('/fixture-binary/'.length))]?.[1];
+    if (!bytes) return response.writeHead(404).end();
+    response.setHeader('Content-Type', 'application/octet-stream'); response.end(bytes);
   } else response.writeHead(404).end();
 });
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -157,13 +170,16 @@ assert.equal(Buffer.byteLength(snapshots.base['part1.cpp']), Buffer.byteLength(s
 assert.equal(Buffer.byteLength(snapshots.edit['common.h']), Buffer.byteLength(snapshots.header['common.h']), 'Header edit must have equal byte length');
 
 const save = async (status, error) => {
-  const median = (values) => { const sorted = values.filter(Number.isFinite).sort((a, b) => a - b); return sorted.length ? sorted[Math.floor(sorted.length / 2)] : null; };
+  const median = (values) => { const sorted = values.filter(Number.isFinite).sort((a, b) => a - b), middle = Math.floor(sorted.length / 2); return sorted.length ? sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2 : null; };
   const comparisons = Object.fromEntries(['cold', 'unchanged', 'edit', 'header'].map((input) => [input, Object.fromEntries(['off', 'reset', 'retained'].map((arm) => {
     const rows = results.filter((row) => row.arm === arm && row.input === input);
     return [arm, { n: rows.length, apiMedianMs: median(rows.map((row) => row.apiMs)), workerBuildMedianMs: median(rows.map((row) => row.result?.timing?.buildMs)), firstMarkerMedianMs: median(rows.map((row) => row.firstMarkerMs)), firstGraphicsBytesMedianMs: median(rows.map((row) => row.firstGraphicsBytesMs)), jsHeapMedianBytes: median(rows.map((row) => row.afterMemory?.jsHeapUsedBytes)) }];
   }))]));
   const receipts = {
     schemaVersion: 1, status, ...(error ? { error: String(error) } : {}), source, browser: browserIdentity,
+    ...(compileFixture ? { supplementalCompileOnlyFixture: true, samplesPerVariant: 1 }
+      : process.argv.includes('--lifecycle-only') ? { lifecycleCases: results.length }
+      : { samplesPerArmAndInput: sampleCount }),
     timingBoundaries: {
       cold: 'Fresh Engine and browser context; no object, worker or retained compiler Module. Network/cache behavior is recorded, not normalized.',
       firstMarkerMs: 'Public Run call to complete expected stdout marker in host listener; not human click latency.',
@@ -202,6 +218,29 @@ function count(stats, key) { const value = stats?.latest?.cache?.[key]; return t
 async function complete(label, files, options = {}) {
   activeReceipt = { label, inputSha256: snapshotHash(files), ...options };
   await page.evaluate((input) => window.probe.begin(input), { label, files, ...options });
+  if (options.action === 'stop-immediately') {
+    activeReceipt.actionProof = await page.evaluate(async () => {
+      const before = window.probe.engine.cacheStats;
+      const active = !window.probe.state.done;
+      await window.probe.engine.stop();
+      return { active, before, after: window.probe.engine.cacheStats };
+    });
+  } else if (options.action === 'clear-during-compile') {
+    await page.waitForFunction(() => window.probe.engine.cacheStats.compilerModuleIdentityBytes > 0 && !window.probe.state.done, undefined, { timeout: 180_000 });
+    activeReceipt.actionProof = await page.evaluate(() => {
+      const before = window.probe.engine.cacheStats;
+      const active = !window.probe.state.done;
+      window.probe.engine.clearCaches();
+      return { active, before, after: window.probe.engine.cacheStats };
+    });
+  } else if (options.action === 'stop-blocked-guest') {
+    await page.waitForFunction((marker) => window.probe.state.stdout.includes(marker) && window.probe.state.deviceBytes > 0, options.marker, { timeout: 180_000 });
+    activeReceipt.actionProof = await page.evaluate(async () => {
+      const active = !window.probe.state.done;
+      await window.probe.engine.stop();
+      return { active, after: window.probe.engine.cacheStats };
+    });
+  }
   await page.waitForFunction(() => window.probe.state.done, undefined, { timeout: 180_000 });
   // Wait one display callback so the screenshot records completed fixture drawing.
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(resolve)));
@@ -248,7 +287,69 @@ try {
     : await chromium.launch({ headless: true, ...(browserName === 'chrome' ? { channel: 'chrome' } : {}) });
   browserIdentity = { requestedBrowser: browserName, version: browser.version(), launchMs: performance.now() - browserLaunchStart, ...(browserName === 'chrome' ? { product: 'Installed Google Chrome', expectedExecutable: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' } : {}), actualSafari: false };
 
-  if (!process.argv.includes('--matrix-only')) {
+  if (compileFixture) {
+    await create(armOptions.retained, 'frozen-course-compile-only');
+    await page.evaluate((paths) => window.probe.loadFixtureBinaries(paths), fixtureBinaries.map(([path]) => path));
+    for (const variant of compileFixture.variants) {
+      const state = await complete(`frozen-course-${variant.label}`, variant.files, { compileOnly: true, useFixtureBinaries: true, artifacts: compileFixture.cppArtifacts });
+      state.fixture = { path: resolve(compileFixturePath), sha256: digest(await readFile(resolve(compileFixturePath))), metadata: compileFixture.metadata };
+      successful(state);
+      assert.equal(state.stdout, '');
+      assert.equal(state.deviceOpens, 0);
+      assert.equal(state.stats.latest.cache.link_ms, 0);
+      assert.equal(state.result.timing.runMs, 0);
+      if (variant.label === 'unchanged') assert.ok(count(state.stats, 'hits') > 0, 'Real fixture must demonstrate actual compiler work skipped');
+    }
+    await close('frozen-course-compile-only');
+  }
+  if (process.argv.includes('--lifecycle-only')) {
+    await create(armOptions.retained, 'actual-lifecycle');
+    const immediate = await complete('actual-immediate-stop-before-ready', snapshots.base, { compileOnly: true, action: 'stop-immediately' });
+    assert.equal(immediate.result.type, 'stopped');
+    assert.equal(immediate.actionProof.active, true);
+    assert.equal(immediate.stats.latest.workerReadyMs, 0, 'Stop must win before observed worker Ready');
+    assert.equal(immediate.stats.entries, 0);
+    assert.equal(immediate.deviceOpens, 0);
+
+    const cleared = await complete('actual-clear-while-compile-active', snapshots.base, { compileOnly: true, action: 'clear-during-compile' });
+    successful(cleared);
+    assert.equal(cleared.actionProof.active, true);
+    assert.equal(cleared.actionProof.after.generation, cleared.actionProof.before.generation + 1);
+    assert.equal(cleared.stats.entries, 0, 'Late clang object messages must not repopulate a cleared cache');
+    assert.equal(cleared.stats.compilerModuleIdentityBytes, 0);
+    assert.equal(cleared.stats.workerRetained, false);
+    const recovered = await complete('actual-clear-recovery', snapshots.base, { marker: expectedMarker() });
+    successful(recovered, expectedMarker());
+    assert.equal(count(recovered.stats, 'misses'), 6);
+    const repeated = await complete('actual-recovery-six-hit-run', snapshots.base, { marker: expectedMarker() });
+    successful(repeated, expectedMarker());
+    assert.equal(count(repeated.stats, 'hits'), 6);
+
+    const blocked = { 'main.cpp': '#include <cstdio>\n#include <fcntl.h>\n#include <unistd.h>\nint main() { int fd = open("/dev/debugger-sh-host", O_RDWR); const char draw[] = "RECT 20 20 150 80 #2563eb\\n"; if (fd < 0 || write(fd, draw, sizeof(draw) - 1) < 0) return 2; printf("BLOCKED GUEST\\n"); fflush(stdout); getchar(); printf("STALE OUTPUT\\n"); return 0; }\n' };
+    const stopped = await complete('actual-stop-blocked-guest', blocked, { marker: 'BLOCKED GUEST', action: 'stop-blocked-guest' });
+    assert.equal(stopped.result.type, 'stopped');
+    assert.equal(stopped.actionProof.active, true);
+    assert.equal(stopped.stdout, 'BLOCKED GUEST\n');
+    assert.equal(stopped.deviceOpens, 1);
+    assert.equal(stopped.deviceCleanups, 1);
+    assert.equal(stopped.stats.entries, 0);
+    await page.waitForTimeout(150);
+    assert.deepEqual(await page.evaluate(() => ({ stdout: window.probe.state.stdout, lateOutput: window.probe.lateOutput ?? 0, lateGraphics: window.probe.lateGraphics ?? 0 })), { stdout: 'BLOCKED GUEST\n', lateOutput: 0, lateGraphics: 0 });
+    const afterStop = await complete('actual-stop-recovery', snapshots.base, { marker: expectedMarker() });
+    successful(afterStop, expectedMarker());
+    assert.equal(count(afterStop.stats, 'hits'), 0);
+    await close('actual-lifecycle');
+
+    await create(armOptions.retained, 'actual-error-recovery');
+    const error = await complete('actual-error-before-recovery', diagnosticFixtures.error);
+    assert.ok(error.result.type === 'completed' && error.result.exitCode !== 0 || error.result.type === 'error');
+    assert.equal(error.stats.entries, 0);
+    assert.equal(error.stats.workerRetained, false);
+    const afterError = await complete('actual-error-recovery', snapshots.base, { marker: expectedMarker() });
+    successful(afterError, expectedMarker());
+    await close('actual-error-recovery');
+  }
+  if (!compileFixture && !process.argv.includes('--lifecycle-only') && !process.argv.includes('--matrix-only')) {
     await create(armOptions.retained, 'compile-only');
     const prepared = await complete('compile-only-six-tu', snapshots.base, { compileOnly: true });
     successful(prepared);
@@ -313,7 +414,7 @@ try {
       await rm(fixtures.directory, { recursive: true, force: true });
     }
   }
-  if (!process.argv.includes('--correctness-only')) {
+  if (!compileFixture && !process.argv.includes('--lifecycle-only') && !process.argv.includes('--correctness-only')) {
     for (let sample = 0; sample < sampleCount; sample++) {
       const arms = ['off', 'reset', 'retained'];
       const order = arms.slice(sample % arms.length).concat(arms.slice(0, sample % arms.length));
@@ -353,7 +454,7 @@ try {
   }
   assert.equal(digest(await readFile(modulePath)), source.moduleSha256, 'Built bundle changed during validation');
   await save('passed');
-  console.log(JSON.stringify({ status: 'passed', evidence: runDirectory, samples: sampleCount, measuredRuns: results.filter(({ sample }) => sample).length }));
+  console.log(JSON.stringify({ status: 'passed', evidence: runDirectory, samples: compileFixture ? 1 : sampleCount, measuredRuns: results.filter(({ sample }) => sample).length, ...(compileFixture ? { compileOnlyRuns: results.length } : {}) }));
 } catch (error) {
   const failureScreenshot = 'failure.png';
   const captured = await page?.screenshot({ path: join(runDirectory, failureScreenshot), fullPage: true }).then(() => true, () => false);

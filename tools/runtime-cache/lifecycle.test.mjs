@@ -59,9 +59,10 @@ const bundle = await build({
               ? 'export const createEngineWorker = () => globalThis.__engineTestWorker();'
               : path === 'binary'
                 ? 'export default new Uint8Array();'
-                : `export default async function init() {};
+                : `let initialized = false; export default async function init() { initialized = true; };
          export const prefetch_urls = () => [];
          export class DapAdapter {
+           constructor() { if (!initialized) throw new Error("Debugger constructed before WASM initialization"); }
            attach(worker) { this.worker = worker; this.listener = e => {
              if (e.data.type === 'stop') this.callback?.({event:'terminated'});
            }; worker.addEventListener('message', this.listener); }
@@ -118,6 +119,51 @@ test('snapshot and mode captured before readiness; one job active', async () => 
   assert.equal(start.is_debug, false);
   complete(worker);
   await job;
+  await engine.dispose();
+});
+
+test('creation owns options before asynchronous initialization', async () => {
+  const configuration = options();
+  const creation = Engine.create('c', configuration);
+  configuration.cpp.scope.projectId = 'mutated';
+  configuration.cpp.retainWorker = false;
+  const engine = await creation;
+  assert.equal(engine.scope.projectId, 'p');
+  engine.debugger.enabled = false;
+  const job = engine.run();
+  const worker = workers.at(-1);
+  worker.emit({ type: 'ready' });
+  complete(worker);
+  await job;
+  assert.equal(engine.cacheStats.workerRetained, true);
+  await engine.dispose();
+});
+
+test('Debug immediately releases a retained Module and never transports its seed', async () => {
+  const engine = await Engine.create('c', options({ cacheCompilerModule: true }));
+  engine.debugger.enabled = false;
+  const first = engine.compile();
+  const retained = workers.at(-1);
+  retained.emit({ type: 'ready' });
+  const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+  retained.emit({
+    type: 'compiler_module',
+    value: { module: new WebAssembly.Module(bytes), bytes, sha256: 'test-identity' }
+  });
+  complete(retained);
+  await first;
+  assert.equal(engine.cacheStats.compilerModuleIdentityBytes, 8);
+  engine.debugger.enabled = true;
+  const debug = engine.run();
+  assert.equal(retained.terminated, true);
+  assert.equal(engine.cacheStats.compilerModuleIdentityBytes, 0);
+  const worker = workers.at(-1);
+  worker.emit({ type: 'ready' });
+  const configuration = worker.messages.find((message) => message.type === 'configure_cpp');
+  assert.equal(configuration.cacheCompilerModule, false);
+  assert.equal(configuration.compilerModule, undefined);
+  complete(worker);
+  await debug;
   await engine.dispose();
 });
 

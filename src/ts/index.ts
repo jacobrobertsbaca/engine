@@ -50,12 +50,23 @@ export type RunResult = CompletedResult | StoppedResult | ErrorResult;
 export type FsNode = string | DirNode;
 export type DirNode = { [name: string]: FsNode };
 
-type WorkerCacheStats = Extract<WorkerOut, { type: 'cpp_cache_stats' }>['stats'];
+/** Bounded, source-free compilation measurements from one worker job. */
+export interface CppTranslationUnitStatistics {
+  hits: number;
+  misses: number;
+  bypasses: Array<{ source: string; reason: string }>;
+  hit_sources: string[];
+  invalid_sources: string[];
+  hash_ms: number;
+  lookup_ms: number;
+  compile_ms: number;
+  link_ms: number;
+}
 export interface CppJobStatistics {
   operation: 'compile' | 'run';
   workerReadyMs: number;
   workerReused: boolean;
-  cache?: WorkerCacheStats;
+  cache?: CppTranslationUnitStatistics;
   compilerModule?: CompilerModuleStats;
 }
 export interface CppCacheStatistics extends ObjectCacheStats {
@@ -111,12 +122,13 @@ export class Engine {
   private latest?: CppJobStatistics;
 
   static async create(lang: Lang, options: EngineOptions = {}): Promise<Engine> {
+    const capturedOptions = structuredClone(options);
     initialization ??= init({ module_or_path: wasmBinary }).catch((error: unknown) => {
       initialization = undefined;
       throw error;
     });
     await initialization;
-    const engine = new Engine(lang, options);
+    const engine = new Engine(lang, capturedOptions);
     if (typeof window !== 'undefined' && typeof fetch !== 'undefined')
       for (const url of prefetch_urls(lang))
         void fetch(url, { cache: 'force-cache' })
@@ -213,7 +225,10 @@ export class Engine {
     )
       return Promise.resolve(errorResult(new TypeError('Invalid host device configuration')));
     clearTimeout(this.idleTimer);
-    if (debug) this.retireWorker();
+    if (debug) {
+      this.retireWorker();
+      this.compilerModule = undefined;
+    }
     this.stdin[Internals].clear();
     const reused = !!this.slot;
     let resolve!: (value: RunResult) => void;
@@ -353,10 +368,11 @@ export class Engine {
       if (!this.current(job)) return;
       job.start.host_device = job.device.workerStart;
     }
+    const cacheCompilerModule = !!this.options?.cacheCompilerModule && !job.debug;
     worker.postMessage({
       type: 'configure_cpp',
-      cacheCompilerModule: !!this.options?.cacheCompilerModule && !job.debug,
-      compilerModule: this.compilerModule
+      cacheCompilerModule,
+      compilerModule: cacheCompilerModule ? this.compilerModule : undefined
     });
     if (this.current(job)) worker.postMessage(job.start);
   }

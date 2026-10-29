@@ -1,5 +1,23 @@
 # Scoped C++ compilation reuse
 
+## Checkpoint status (2026-10-29)
+
+This branch is an unreleased implementation checkpoint. The earlier synthetic
+Chrome matrix passed, but the actual Marble snapshot conservatively bypassed all
+translation units. Guard revisions must safely admit harmless header comments
+while blocking volatile macro synthesis through trusted system-header helpers.
+The final source must be rebuilt without concurrent edits and then pass real
+Marble, lifecycle, diagnostic, stdin/DAP, and performance checks before merge or
+release. Measurements from an earlier build must not be attributed to this
+checkpoint. Safari remote automation is unavailable; its new optimizations
+remain disabled and the prior compiler trap is unresolved.
+
+The guard checkpoint includes encoded raw-string rejection and normalized
+dependency classification. Ten native guard tests and 24 JavaScript
+cache/Module/lifecycle tests passed. The revised Rust worker integration has not
+been built to WebAssembly or validated in Chrome; those passes do not establish
+release readiness.
+
 All optimizations are off by default. One Engine belongs to one project and account;
 create a new Engine and await disposal of the old one when either changes.
 
