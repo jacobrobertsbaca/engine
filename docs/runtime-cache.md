@@ -1,23 +1,5 @@
 # Scoped C++ compilation reuse
 
-## Checkpoint status (2026-10-29)
-
-This branch is an unreleased implementation checkpoint. The earlier synthetic
-Chrome matrix passed, but the actual Marble snapshot conservatively bypassed all
-translation units. Guard revisions must safely admit harmless header comments
-while blocking volatile macro synthesis through trusted system-header helpers.
-The final source must be rebuilt without concurrent edits and then pass real
-Marble, lifecycle, diagnostic, stdin/DAP, and performance checks before merge or
-release. Measurements from an earlier build must not be attributed to this
-checkpoint. Safari remote automation is unavailable; its new optimizations
-remain disabled and the prior compiler trap is unresolved.
-
-The guard checkpoint includes encoded raw-string rejection and normalized
-dependency classification. Ten native guard tests and 24 JavaScript
-cache/Module/lifecycle tests passed. The revised Rust worker integration has not
-been built to WebAssembly or validated in Chrome; those passes do not establish
-release readiness.
-
 All optimizations are off by default. One Engine belongs to one project and account;
 create a new Engine and await disposal of the old one when either changes.
 
@@ -69,7 +51,11 @@ because direct, indirect and dynamic source includes fail closed. Actual depfile
 validate transitive dependencies before admission. Headers and source use
 conservative preprocessor guards; unexpected, volatile, diagnostic, system-header
 and binary-text inputs bypass. Trusted toolchain headers are bound to the actual
-sysroot bytes and checked for volatile builtins. Opaque PCH inputs currently bypass
+sysroot bytes and checked for volatile builtins. Actual trusted-header definitions
+that paste tokens or invoke pragmas taint all referring aliases and wrappers;
+user/support references to these macros bypass. Analysis normalizes dependency
+paths before classification, admits harmless comments, and fails closed on
+unsupported lexical forms or analysis bounds. Opaque PCH inputs currently bypass
 TU caching because their hidden macro and diagnostic state cannot be verified;
 PCH compilation and archives retain their original behavior. PCH bytes still
 participate in resource identity. Unused unsafe headers do not bypass unrelated TUs.
@@ -146,6 +132,11 @@ behavior, counterbalances three arms and separates cold, unchanged, equal-length
 semantic edits and header edits. Its synthetic six-TU matrix is distinct from
 real Marble/Vector staging validation. JS heap and available browser-attributed
 memory measurements have explicit limits; unavailable endpoints remain unavailable.
+In the exact Marble snapshot, the generated driver is eligible but its other
+translation units currently bypass due to volatile or unsupported system macros.
+Compiler worker/Module reuse still applies to eligible ordinary Run-profile jobs.
+Actual Safari automation was unavailable because remote automation is disabled;
+new course optimizations remain off there and the prior compiler trap is unresolved.
 The historical exploratory JSON/DOCX files named in the implementation request
 were not present locally, so those figures are reference claims, not reproduced
 benchmarks or acceptance guarantees. No one-to-three-second edited Run is promised.
