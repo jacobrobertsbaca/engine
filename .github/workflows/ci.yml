@@ -37,5 +37,14 @@ jobs:
       - name: Build engine (Rust → WASM → JS)
         run: npm run build
 
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Runtime cache and lifecycle tests
+        run: node --experimental-strip-types --test tools/runtime-cache/*.test.*
+
+      - name: TU cache identity and guard tests
+        run: cargo test -p engine-cpp-cache-tests
+
       - name: Lint
         run: npx eslint src/

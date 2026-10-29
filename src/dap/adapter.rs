@@ -18,12 +18,12 @@ use crate::types::DebugInfo;
 struct AdapterState {
     session: DapSession,
     filter_internals: bool,
-    _closure: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
 }
 
 #[wasm_bindgen]
 pub struct DapAdapter {
     state: Rc<RefCell<AdapterState>>,
+    attachment: RefCell<Option<(web_sys::Worker, Closure<dyn FnMut(web_sys::MessageEvent)>)>>,
 }
 
 #[wasm_bindgen]
@@ -34,8 +34,8 @@ impl DapAdapter {
             state: Rc::new(RefCell::new(AdapterState {
                 session: DapSession::new(),
                 filter_internals: false,
-                _closure: None,
             })),
+            attachment: RefCell::new(None),
         }
     }
 
@@ -45,7 +45,8 @@ impl DapAdapter {
     /// the internal debugger, `paused` messages to emit DAP `stopped` events,
     /// and `stop` messages to emit `terminated`.
     pub fn attach(&self, worker: web_sys::Worker) {
-        self.state.borrow_mut().session.reset_run();
+        self.detach();
+        self.reset_run();
 
         let state = self.state.clone();
 
@@ -101,7 +102,19 @@ impl DapAdapter {
             .add_event_listener_with_callback("message", closure.as_ref().unchecked_ref())
             .expect("Added message listener to worker");
 
-        self.state.borrow_mut()._closure = Some(closure);
+        *self.attachment.borrow_mut() = Some((worker, closure));
+    }
+
+    /// Retire the listener without borrowing session state (callbacks can synchronously Stop).
+    pub fn detach(&self) {
+        if let Some((worker, closure)) = self.attachment.borrow_mut().take() {
+            let _ = worker.remove_event_listener_with_callback("message", closure.as_ref().unchecked_ref());
+        }
+    }
+
+    #[wasm_bindgen(js_name = "resetRun")]
+    pub fn reset_run(&self) {
+        self.state.borrow_mut().session.reset_run();
     }
 
     #[wasm_bindgen(js_name = "sendMessage")]

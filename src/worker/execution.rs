@@ -1,10 +1,12 @@
 use flate2::read::GzDecoder;
 use js_sys::SharedArrayBuffer;
+use std::cell::RefCell;
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tar::Archive;
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
 use wasmer::{Module, RuntimeError, Store};
 use wasmer_wasix::types::wasi::ExitCode;
@@ -25,9 +27,26 @@ use super::runtime::JsRuntime;
 
 use std::fmt::Debug;
 
+thread_local! {
+    // Explicitly installed by our worker entrypoint. Only immutable compiler code is retained.
+    static COMPILER_MODULE_CONSTRUCTOR: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
+    static COMPILER_INSTANCE_OBSERVER: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
+}
+
+#[wasm_bindgen]
+pub fn set_compiler_module_constructor(constructor: js_sys::Function) {
+    COMPILER_MODULE_CONSTRUCTOR.with(|slot| *slot.borrow_mut() = Some(constructor));
+}
+
+#[wasm_bindgen]
+pub fn set_compiler_instance_observer(observer: js_sys::Function) {
+    COMPILER_INSTANCE_OBSERVER.with(|slot| *slot.borrow_mut() = Some(observer));
+}
+
 pub struct Execution {
     pub fs: mem_fs::FileSystem,
     pub stdin_buffer: js_sys::SharedArrayBuffer,
+    output_bytes: Arc<AtomicU64>,
 }
 
 pub struct Step<'a> {
@@ -38,6 +57,7 @@ pub struct Step<'a> {
     sysroot: Option<String>,
     union_fs: Option<Box<dyn FileSystem>>,
     debug: bool,
+    compiler: bool,
     envs: Vec<(String, String)>,
     device_files: Vec<(PathBuf, Box<dyn wasmer_wasix::virtual_fs::VirtualFile + Send + Sync>)>,
 }
@@ -47,7 +67,13 @@ impl Execution {
         Self {
             fs: mem_fs::FileSystem::default(),
             stdin_buffer,
+            output_bytes: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Count both streams while preserving their original delivery and contents.
+    pub fn output_bytes(&self) -> u64 {
+        self.output_bytes.load(Ordering::Relaxed)
     }
 
     pub fn step<'a>(&'a self, name: &str) -> Step<'a> {
@@ -58,6 +84,7 @@ impl Execution {
             sysroot: None,
             union_fs: None,
             debug: false,
+            compiler: false,
             envs: Vec::new(),
             device_files: Vec::new(),
         }
@@ -90,6 +117,12 @@ impl<'a> Step<'a> {
     /// If it starts with a "/", it is treated as an absolute path in the current filesystem.
     pub fn binary(mut self, url_or_path: &str) -> Self {
         self.binary = Some(String::from(url_or_path));
+        self
+    }
+
+    /// Only LLVM compiler/linker steps may use immutable compiler Module retention.
+    pub fn compiler(mut self) -> Self {
+        self.compiler = true;
         self
     }
 
@@ -192,7 +225,28 @@ impl<'a> Step<'a> {
         };
 
         let mut store = Store::default();
-        let module = Module::from_binary(&store, &binary_bytes).ensure("Created WASM module")?;
+        let constructor = if self.compiler {
+            COMPILER_MODULE_CONSTRUCTOR.with(|slot| slot.borrow().clone())
+        } else {
+            None
+        };
+        let module = if let Some(constructor) = constructor {
+            // The JS constructor synchronously takes its own snapshot before its first await.
+            let bytes = unsafe { js_sys::Uint8Array::view(&binary_bytes) };
+            let promise = constructor
+                .call1(&JsValue::UNDEFINED, bytes.as_ref())
+                .ensure("Constructed compiler Module")?;
+            let module: js_sys::WebAssembly::Module =
+                JsFuture::from(js_sys::Promise::resolve(&promise))
+                    .await
+                    .ensure("Compiled compiler Module")?
+                    .dyn_into()
+                    .ensure("Received compiler Module")?;
+            // Wasmer's supported JS conversion reparses type hints from these verified bytes.
+            Module::from((module, binary_bytes))
+        } else {
+            Module::from_binary(&store, &binary_bytes).ensure("Created WASM module")?
+        };
 
         /* Fetch the sysroot and union into the vfs if needed */
         if let Some(sysroot_loc) = &self.sysroot {
@@ -223,7 +277,8 @@ impl<'a> Step<'a> {
                 .ensure("Registered device file")?;
         }
 
-        /* Configure Wasmer WASI environment */
+        /* Configure a fresh Wasmer WASI environment and Instance on every invocation. */
+        let instance_start = instant::Instant::now();
         for (k, v) in &self.envs {
             self.builder.add_env(k, v);
         }
@@ -231,8 +286,8 @@ impl<'a> Step<'a> {
             .builder
             .runtime(JsRuntime::instance())
             .fs(Box::new(self.exec.fs.clone()))
-            .stdout(Box::new(Stdout::new(StdoutMode::Out)))
-            .stderr(Box::new(Stdout::new(StdoutMode::Err)))
+            .stdout(Box::new(Stdout::new_counted(StdoutMode::Out, self.exec.output_bytes.clone())))
+            .stderr(Box::new(Stdout::new_counted(StdoutMode::Err, self.exec.output_bytes.clone())))
             .stdin(Box::new(Stdin::new(&self.exec.stdin_buffer)));
 
         builder
@@ -264,6 +319,15 @@ impl<'a> Step<'a> {
                 .ensure("Instantiated Wasmer instance")?;
             instance
         };
+
+        if self.compiler {
+            COMPILER_INSTANCE_OBSERVER.with(|slot| {
+                if let Some(observer) = slot.borrow().as_ref() {
+                    let milliseconds = instance_start.elapsed().as_secs_f64() * 1000.0;
+                    let _ = observer.call1(&JsValue::UNDEFINED, &milliseconds.into());
+                }
+            });
+        }
 
         let start = instance
             .exports

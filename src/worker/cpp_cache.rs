@@ -1,0 +1,471 @@
+//! Conservative v1 identities. The host owns the bounded LRU; workers only accept
+//! owned, digest-checked relocatable objects and never retain mutable compiler state.
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use wasmparser::{Encoding, KnownCustom, Linking, Parser, Payload, Validator, WasmFeatures};
+
+pub const SCHEMA: &str = "debugger-sh/cpp-tu/v1/guard2";
+const RELEASE: &str = include_str!("../../package.json");
+pub const MAX_REPORTED_SOURCES: usize = 256;
+pub const MAX_SOURCE_PATH: usize = 4096;
+
+pub fn hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Length prefixes keep identities unambiguous, including ordered arguments.
+fn add(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+pub struct Inputs {
+    source_hashes: BTreeMap<String, (String, Option<&'static str>)>,
+    file_guards: BTreeMap<String, Option<&'static str>>,
+    resources: String,
+    paths: String,
+    all_paths: BTreeSet<String>,
+    pub user_paths: BTreeSet<String>,
+    pub opaque_paths: BTreeSet<String>,
+    bypass: Option<&'static str>,
+}
+
+impl Inputs {
+    pub fn new<'a>(
+        files: impl IntoIterator<Item = (String, &'a [u8], bool)>,
+        mut paths: Vec<String>,
+        sources: &[String],
+    ) -> Self {
+        let selected: BTreeSet<_> = sources.iter().collect();
+        let files: BTreeMap<_, _> = files.into_iter().map(|(p, b, text)| (p, (b, text))).collect();
+        let mut resources = Sha256::new();
+        let mut source_hashes = BTreeMap::new();
+        let mut file_guards = BTreeMap::new();
+        let mut bypass = None;
+        for (path, (bytes, text)) in &files {
+            if !canonical_path(path) || path.len() > MAX_SOURCE_PATH {
+                bypass = Some("unsupported-path");
+            }
+            let guard = if *text { text_guard(bytes) } else { None };
+            file_guards.insert(path.clone(), guard);
+            if selected.contains(path) {
+                source_hashes.insert(path.clone(), (hash(bytes), guard));
+            } else {
+                add(&mut resources, path.as_bytes());
+                add(&mut resources, bytes);
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let all_paths = paths.iter().cloned().collect();
+        let mut path_hash = Sha256::new();
+        for path in paths {
+            if !canonical_path(&path) || path.len() > MAX_SOURCE_PATH {
+                bypass = Some("unsupported-path");
+            }
+            add(&mut path_hash, path.as_bytes());
+        }
+        let opaque_paths = files.iter().filter(|(_, (_, text))| !text).map(|(path, _)| path.clone()).collect();
+        Self {
+            source_hashes,
+            file_guards,
+            resources: format!("{:x}", resources.finalize()),
+            paths: format!("{:x}", path_hash.finalize()),
+            all_paths,
+            user_paths: files.into_keys().collect(),
+            opaque_paths,
+            bypass,
+        }
+    }
+
+    pub fn bypass(&self, source: &str) -> Option<&'static str> {
+        if self.all_paths.contains(&format!("{source}.o.d")) { return Some("dependency-path-collision"); }
+        self.bypass.or_else(|| self.source_hashes.get(source).and_then(|(_, reason)| *reason))
+    }
+
+    /// Resource bytes are always hashed, but unused headers cannot introduce
+    /// compiler diagnostics or volatile expansions into this translation unit.
+    pub fn dependency_bypass(&self, depfile: &[u8]) -> Option<&'static str> {
+        for dependency in dependencies(depfile)? {
+            let path = normalized_dependency(&dependency)?;
+            if let Some(Some(reason)) = self.file_guards.get(&path) { return Some(reason); }
+        }
+        None
+    }
+
+    pub fn key(
+        &self,
+        source: &str,
+        compiler: &str,
+        sysroot: &str,
+        exceptions: &str,
+        compile_args: &[String],
+        link_args: &[String],
+    ) -> Option<String> {
+        let (source_hash, _) = self.source_hashes.get(source)?;
+        let mut key = Sha256::new();
+        for value in [SCHEMA, RELEASE, env!("CARGO_PKG_VERSION"), "c++23/wasm-legacy-eh/run", compiler, sysroot, exceptions, &self.paths, &self.resources, source, source_hash] {
+            add(&mut key, value.as_bytes());
+        }
+        add(&mut key, b"compile");
+        for arg in compile_args { add(&mut key, arg.as_bytes()); }
+        add(&mut key, b"link");
+        for arg in link_args { add(&mut key, arg.as_bytes()); }
+        Some(format!("{:x}", key.finalize()))
+    }
+}
+
+fn canonical_path(path: &str) -> bool {
+    path.starts_with('/') && path != "/" && !path.chars().any(|c| c.is_control() || matches!(c, '\\' | '$' | ':'))
+        && path.split('/').skip(1).all(|part| !matches!(part, "" | "." | ".."))
+}
+
+/// These constructs can make diagnostics or generated code depend on more than
+/// the frozen input bytes. Unknown include forms and pragmas deliberately bypass.
+fn text_guard(bytes: &[u8]) -> Option<&'static str> {
+    let Ok(text) = std::str::from_utf8(bytes) else { return Some("binary-text"); };
+    if bytes.iter().any(|byte| *byte < 32 && !matches!(byte, b'\t' | b'\n' | b'\r') || *byte == 127) {
+        return Some("binary-text");
+    }
+    let text = normalize_lines(text);
+    if volatile_macro(text.as_bytes()) {
+        return Some("volatile-macro");
+    }
+    // Reject trigraph spellings before comment masking can hide them.
+    if ["??=", "??/", "??'", "??(", "??)", "??!", "??<", "??>", "??-"].iter().any(|token| text.contains(token)) {
+        return Some("dynamic-directive");
+    }
+    let Some(text) = strip_comments(&text) else { return Some("dynamic-directive"); };
+    if ["_Pragma", "__pragma", "##", "%:"].iter().any(|token| text.contains(token)) {
+        return Some("dynamic-directive");
+    }
+    for line in text.lines() {
+        let Some(directive) = line.trim_start().strip_prefix('#') else { continue; };
+        let directive = directive.trim_start();
+        if directive.starts_with(|c: char| c.is_ascii_digit()) { return Some("diagnostic-or-system-pragma"); }
+        let end = directive.find(|c: char| !c.is_ascii_alphabetic() && c != '_').unwrap_or(directive.len());
+        let (name, rest) = directive.split_at(end);
+        let rest = rest.trim();
+        match name {
+            "pragma" if rest == "once" => (),
+            "pragma" => return Some("diagnostic-or-system-pragma"),
+            "include" => {
+                let closing = match rest.as_bytes().first() { Some(b'"') => '"', Some(b'<') => '>', _ => return Some("dynamic-include") };
+                let Some(end) = rest[1..].find(closing).map(|i| i + 1) else { return Some("dynamic-include"); };
+                if !rest[end + 1..].trim().is_empty() || rest[1..end].contains('\\') {
+                    return Some("dynamic-include");
+                }
+                let include = &rest[1..end];
+                let ext = include.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+                if matches!(ext.as_str(), "c" | "cc" | "cp" | "cpp" | "cxx" | "c++") {
+                    return Some("source-include");
+                }
+            }
+            "include_next" | "import" | "embed" => return Some("dynamic-include"),
+            _ => (),
+        }
+    }
+    None
+}
+
+/// Also checked in actual transitive sysroot headers before admitting an object.
+/// Their ordinary system-header pragmas do not change compiler warning policy.
+pub fn volatile_macro(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else { return true; };
+    let text = normalize_lines(text);
+    ["__DATE__", "__TIME__", "__TIMESTAMP__", "__COUNTER__"].iter().any(|token| text.contains(token))
+}
+
+fn normalize_lines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n").replace("\\\n", "")
+}
+
+fn strip_comments(text: &str) -> Option<String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if text.contains('\u{feff}') { return None; }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            for c in chars.by_ref() { if c == '\n' { out.push(c); break; } }
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            chars.next(); out.push(' ');
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                if c == '\n' { out.push(c); }
+                if c == '*' && chars.peek() == Some(&'/') { chars.next(); closed = true; break; }
+            }
+            if !closed { return None; }
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let mut word = String::from(c);
+            while let Some(&next) = chars.peek() {
+                if next.is_ascii_alphanumeric() || next == '_' { word.push(next); chars.next(); }
+                else { break; }
+            }
+            // This includes every encoding prefix: R, u8R, uR, UR and LR.
+            if word.ends_with('R') && chars.peek() == Some(&'"') { return None; }
+            out.push_str(&word);
+        }
+        else if c.is_ascii_digit() {
+            // A preprocessing number owns digit separators; they are not char quotes.
+            out.push(c);
+            let mut previous = c;
+            while let Some(&next) = chars.peek() {
+                if next.is_alphanumeric() || matches!(next, '_' | '.' | '\'') || (matches!(next, '+' | '-') && matches!(previous, 'e' | 'E' | 'p' | 'P')) {
+                    out.push(next); chars.next(); previous = next;
+                } else { break; }
+            }
+        } else if c == '"' || c == '\'' {
+            out.push(c);
+            loop {
+                let next = chars.next()?;
+                if next == '\n' { return None; }
+                out.push(next);
+                if next == '\\' {
+                    let escaped = chars.next()?;
+                    if escaped == '\n' { return None; }
+                    out.push(escaped);
+                } else if next == c { break; }
+            }
+        } else if c == '\\' { return None; }
+        else { out.push(c); }
+    }
+    Some(out)
+}
+
+const MAX_MACRO_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MACRO_DEFINITIONS: usize = 16_384;
+
+fn identifiers(text: &str) -> BTreeSet<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|word| !word.is_empty()).map(String::from).collect()
+}
+
+/// Conservative over-approximation: keep definitions in inactive branches and
+/// across redefinitions, and even references in ordinary string literals. A
+/// false positive bypasses; it never enables an unsafe macro expansion.
+pub fn trusted_macro_taint(headers: &[Vec<u8>]) -> Option<BTreeSet<String>> {
+    let mut total = 0usize;
+    let mut definitions: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut reference_count = 0usize;
+    let mut tainted = BTreeSet::from(["_Pragma".into(), "__pragma".into()]);
+    for bytes in headers {
+        total = total.checked_add(bytes.len())?;
+        if total > MAX_MACRO_BYTES { return None; }
+        let text = normalize_lines(std::str::from_utf8(bytes).ok()?);
+        if ["??=", "??/", "??'", "??(", "??)", "??!", "??<", "??>", "??-", "%:"].iter().any(|token| text.contains(token)) { return None; }
+        let text = strip_comments(&text)?;
+        for line in text.lines() {
+            let Some(directive) = line.trim_start().strip_prefix('#') else { continue; };
+            let directive = directive.trim_start();
+            let Some(rest) = directive.strip_prefix("define") else { continue; };
+            if !rest.starts_with(char::is_whitespace) { continue; }
+            let rest = rest.trim_start();
+            let length = rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_').unwrap_or(rest.len());
+            let (name, replacement) = rest.split_at(length);
+            if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) || name.len() > MAX_SOURCE_PATH { return None; }
+            let replacement = if replacement.starts_with('(') {
+                let close = replacement.find(')')?;
+                if replacement[1..close].chars().any(|c| !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace() && !matches!(c, '_' | ',' | '.')) { return None; }
+                &replacement[close + 1..]
+            } else { replacement };
+            let references = identifiers(replacement);
+            reference_count = reference_count.checked_add(references.len())?;
+            if reference_count > 65_536 { return None; }
+            if replacement.contains("##") || references.contains("_Pragma") || references.contains("__pragma") { tainted.insert(name.into()); }
+            definitions.entry(name.into()).or_default().extend(references);
+            if definitions.len() > MAX_MACRO_DEFINITIONS { return None; }
+        }
+    }
+    // Transitive closure includes object aliases and function-like wrappers.
+    let mut reverse: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (name, references) in &definitions {
+        for reference in references { reverse.entry(reference).or_default().push(name); }
+    }
+    let mut pending: Vec<String> = tainted.iter().cloned().collect();
+    while let Some(name) = pending.pop() {
+        if let Some(parents) = reverse.get(name.as_str()) {
+            for parent in parents { if tainted.insert((*parent).into()) { pending.push((*parent).into()); } }
+        }
+    }
+    Some(tainted)
+}
+
+pub fn references_tainted_macro(bytes: &[u8], tainted: &BTreeSet<String>) -> bool {
+    if bytes.len() > MAX_MACRO_BYTES { return true; }
+    let Some(text) = std::str::from_utf8(bytes).ok().map(normalize_lines).and_then(|text| strip_comments(&text)) else { return true; };
+    identifiers(&text).iter().any(|name| tainted.contains(name))
+}
+
+/// Clang's make-style depfiles escape whitespace, '#', ':' and backslashes and
+/// wrap lines. Reject malformed/multiple rules rather than guessing dependencies.
+pub fn dependencies(data: &[u8]) -> Option<Vec<String>> {
+    let data = std::str::from_utf8(data).ok()?.replace("\\\r\n", "").replace("\\\n", "");
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut target = false;
+    let mut chars = data.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => token.push(chars.next()?),
+            ':' if !target => { if token.is_empty() { return None; } token.clear(); target = true; },
+            ':' | '$' => return None,
+            '#' => { for c in chars.by_ref() { if c == '\n' { break; } } },
+            c if c.is_whitespace() => { if !token.is_empty() { if !target { return None; } tokens.push(std::mem::take(&mut token)); } },
+            c => token.push(c),
+        }
+    }
+    if !token.is_empty() { tokens.push(token); }
+    (target && !tokens.is_empty()).then_some(tokens)
+}
+
+pub fn normalized_dependency(path: &str) -> Option<String> {
+    if !path.starts_with('/') { return None; }
+    let mut parts = Vec::new();
+    for part in path.split('/').skip(1) {
+        match part { "" | "." => (), ".." => { parts.pop()?; }, part => parts.push(part) }
+    }
+    let path = format!("/{}", parts.join("/"));
+    canonical_path(&path).then_some(path)
+}
+
+pub fn dependencies_valid(data: &[u8], source: &str, sources: &[String], user_paths: &BTreeSet<String>, opaque_paths: &BTreeSet<String>) -> bool {
+    let Some(deps) = dependencies(data) else { return false; };
+    let mut saw_source = false;
+    for dependency in deps {
+        let Some(path) = normalized_dependency(&dependency) else { return false; };
+        if opaque_paths.contains(&path) { return false; }
+        if path == source { saw_source = true; }
+        else if sources.contains(&path) { return false; }
+        else if !user_paths.contains(&path) && !path.starts_with("/include/") && !path.starts_with("/lib/") { return false; }
+    }
+    saw_source
+}
+
+pub fn valid_object(bytes: &[u8], expected_hash: &str) -> bool {
+    if expected_hash.len() != 64 || hash(bytes) != expected_hash { return false; }
+    if Validator::new_with_features(WasmFeatures::all()).validate_all(bytes).is_err() { return false; }
+    let mut linking = false;
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload {
+            Ok(Payload::Version { encoding: Encoding::Module, .. }) => (),
+            Ok(Payload::Version { .. }) | Ok(Payload::StartSection { .. }) | Err(_) => return false,
+            Ok(Payload::CustomSection(section)) if section.name() == "linking" => {
+                if linking { return false; }
+                let KnownCustom::Linking(reader) = section.as_known() else { return false; };
+                linking = true;
+                for item in reader {
+                    let valid = match item {
+                        Ok(Linking::SegmentInfo(map)) => map.into_iter().all(|r| r.is_ok()),
+                        Ok(Linking::InitFuncs(map)) => map.into_iter().all(|r| r.is_ok()),
+                        Ok(Linking::SymbolTable(map)) => map.into_iter().all(|r| r.is_ok()),
+                        Ok(Linking::ComdatInfo(map)) => map.into_iter().all(|r| r.is_ok_and(|c| c.symbols.into_iter().all(|r| r.is_ok()))),
+                        _ => false,
+                    };
+                    if !valid { return false; }
+                }
+            }
+            Ok(Payload::CustomSection(section)) if section.name().starts_with("reloc.") => {
+                let KnownCustom::Reloc(reader) = section.as_known() else { return false; };
+                if !reader.entries().into_iter().all(|r| r.is_ok()) { return false; }
+            }
+            _ => (),
+        }
+    }
+    linking
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn inputs<'a>(main: &'a str, other: &'a str, header: &'a str, extra: bool) -> Inputs {
+        let mut files: Vec<(String, &[u8], bool)> = vec![("/a.cpp".into(), main.as_bytes(), true), ("/b.cpp".into(), other.as_bytes(), true), ("/x.h".into(), header.as_bytes(), true), ("/lib.a".into(), &[0, 1, 2][..], false)];
+        if extra { files.push(("/new.h".into(), b"" as &[u8], true)); }
+        let paths = files.iter().map(|(p, _, _)| p.clone()).collect();
+        Inputs::new(files, paths, &["/a.cpp".into(), "/b.cpp".into()])
+    }
+    fn key(inputs: &Inputs) -> String { inputs.key("/a.cpp", "clang", "sysroot", "eh", &["-Werror".into()], &["-lc++".into()]).unwrap() }
+    #[test] fn comments_line_endings_literals_and_raw_prefixes_fail_closed() {
+        assert!(text_guard(b"/* Hi?there??Jim; R\"; ##; _Pragma */\rint n=1'000; const char* p=\"TMPDIR\";\r").is_none());
+        assert_eq!(text_guard(b"// harmless\r__TI\\\rME__"), Some("volatile-macro"));
+        assert!(text_guard("\u{feff}#pragma GCC system_header".as_bytes()).is_some());
+        for source in ["R\"(raw)\"", "u8R\"(raw)\"", "uR\"(raw)\"", "UR\"(raw)\"", "LR\"(raw)\"", "const char* s=\"unterminated\n#pragma once", "/* unterminated", "// trigraph ??/\n_Pragma(\"once\")", "auto n=1'000; auto s=\"' /*\"; _Pragma(\"once\"); auto t=\"*/\";"] {
+            assert!(text_guard(source.as_bytes()).is_some(), "{source}");
+        }
+    }
+    #[test] fn trusted_concat_and_pragma_aliases_taint_all_wrappers() {
+        let headers = vec![b"#define CONCAT(a,b) a##b\n#define ALIAS CONCAT\n#define WRAP(a,b) ALIAS(a,b)\n#define DIAG(x) _Pragma(x)\n#define DIAG_ALIAS DIAG\n#define SAFE(x) ((x)+1)\n".to_vec()];
+        let tainted = trusted_macro_taint(&headers).unwrap();
+        for name in ["CONCAT", "ALIAS", "WRAP", "DIAG", "DIAG_ALIAS"] { assert!(tainted.contains(name)); }
+        assert!(!tainted.contains("SAFE"));
+        assert!(references_tainted_macro(b"const char* t=WRAP(__TI,ME__);", &tainted));
+        assert!(references_tainted_macro(b"#define INDIRECT WRAP\n", &tainted));
+        assert!(!references_tainted_macro(b"// WRAP is documentation\nint value=SAFE(1);", &tainted));
+        assert!(trusted_macro_taint(&[b"#define BAD(a\n".to_vec()]).is_none());
+        assert!(trusted_macro_taint(&[vec![b' '; MAX_MACRO_BYTES + 1]]).is_none());
+    }
+    #[test] fn same_length_source_and_header_edits_invalidate_but_other_tu_does_not() {
+        let base = key(&inputs("return 1;", "return 2;", "#define X 1", false));
+        assert_ne!(base, key(&inputs("return 3;", "return 2;", "#define X 1", false)));
+        assert_ne!(base, key(&inputs("return 1;", "return 2;", "#define X 2", false)));
+        assert_eq!(base, key(&inputs("return 1;", "return 3;", "#define X 1", false)));
+        assert_ne!(base, key(&inputs("return 1;", "return 2;", "#define X 1", true)));
+    }
+    #[test] fn identity_flags_and_order_invalidate() {
+        let inputs = inputs("int a;", "int b;", "", false);
+        let base = key(&inputs);
+        for (compiler, sysroot, eh, compile, link) in [("new", "sysroot", "eh", vec!["-Werror"], vec!["-lc++"]), ("clang", "new", "eh", vec!["-Werror"], vec!["-lc++"]), ("clang", "sysroot", "new", vec!["-Werror"], vec!["-lc++"]), ("clang", "sysroot", "eh", vec!["-O0", "-Werror"], vec!["-lc++"]), ("clang", "sysroot", "eh", vec!["-Werror"], vec!["-lc", "-lc++"])] {
+            assert_ne!(base, inputs.key("/a.cpp", compiler, sysroot, eh, &compile.into_iter().map(String::from).collect::<Vec<_>>(), &link.into_iter().map(String::from).collect::<Vec<_>>()).unwrap());
+        }
+    }
+    #[test] fn resource_bytes_paths_and_pch_archive_identity_invalidate() {
+        fn resource(path: &str, bytes: &[u8]) -> Inputs {
+            Inputs::new(vec![("/a.cpp".into(), b"int a;" as &[u8], true), (path.into(), bytes, false)], vec!["/a.cpp".into(), path.into()], &["/a.cpp".into()])
+        }
+        for path in ["/support.a", "/header.pch", "/resource.bin"] {
+            assert_ne!(key(&resource(path, b"123")), key(&resource(path, b"124")));
+            assert_ne!(key(&resource(path, b"123")), key(&resource(&format!("{path}.renamed"), b"123")));
+        }
+        assert_ne!(key(&resource("/support.a", b"123")), key(&Inputs::new(vec![("/a.cpp".into(), b"int a;" as &[u8], true)], vec!["/a.cpp".into()], &["/a.cpp".into()])));
+    }
+    #[test] fn unused_unsafe_headers_do_not_bypass_but_actual_dependencies_do() {
+        let inputs = inputs("int a;", "int b;", "#pragma clang diagnostic ignored \"-Wunused\"", false);
+        assert!(inputs.bypass("/a.cpp").is_none());
+        assert!(inputs.dependency_bypass(b"/a.cpp.o: /a.cpp").is_none());
+        assert_eq!(inputs.dependency_bypass(b"/a.cpp.o: /a.cpp /x.h"), Some("diagnostic-or-system-pragma"));
+        assert!(volatile_macro(b"#define CLOCK __TI\\\nME__"));
+    }
+    #[test] fn dependency_output_collisions_bypass_for_files_and_directories() {
+        let files = Inputs::new(vec![("/a.cpp".into(), b"int a;" as &[u8], true), ("/a.cpp.o.d".into(), b"student bytes" as &[u8], true)], vec!["/a.cpp".into(), "/a.cpp.o.d".into()], &["/a.cpp".into()]);
+        let directory = Inputs::new(vec![("/a.cpp".into(), b"int a;" as &[u8], true)], vec!["/a.cpp".into(), "/a.cpp.o.d".into()], &["/a.cpp".into()]);
+        assert_eq!(files.bypass("/a.cpp"), Some("dependency-path-collision"));
+        assert_eq!(directory.bypass("/a.cpp"), Some("dependency-path-collision"));
+    }
+    #[test] fn dangerous_preprocessor_forms_bypass() {
+        for text in ["__TIME__", "__DA\\\nTE__", "#include HEADER", "#include \"b.cpp\"", "/*x*/ #pragma GCC system_header", "# 1 \"x.h\" 3",  "#pragma clang diagnostic ignored \"-Wunused\"", "_Pragma(\"once\")", "#define X(a,b) a ## b", "abc\0def"] { assert!(text_guard(text.as_bytes()).is_some(), "{text}"); }
+        assert!(text_guard(b"#line 1 \"main.cpp\"\nint main() { return 0; }").is_none());
+        assert!(text_guard(b"#pragma once\n#include \"safe.h\"\nint f() { return 1; }").is_none());
+    }
+    #[test] fn depfile_escaping_and_source_dependency_guard() {
+        let user_paths = BTreeSet::from([String::from("/evil.h")]);
+        let canonical = normalized_dependency("/include/../evil.h").unwrap();
+        assert!(user_paths.contains(&canonical));
+        assert_eq!(dependencies(b"/a.cpp.o: /a.cpp /space\\ name.h \\\n /hash\\#name.h\n").unwrap(), vec!["/a.cpp", "/space name.h", "/hash#name.h"]);
+        let paths = BTreeSet::from(["/a.cpp".into(), "/b.cpp".into(), "/x.h".into()]);
+        assert!(dependencies_valid(b"/a.cpp.o: /a.cpp /x.h\n", "/a.cpp", &["/a.cpp".into(), "/b.cpp".into()], &paths, &BTreeSet::new()));
+        assert!(!dependencies_valid(b"/a.cpp.o: /a.cpp /b.cpp\n", "/a.cpp", &["/a.cpp".into(), "/b.cpp".into()], &paths, &BTreeSet::new()));
+        assert!(!dependencies_valid(b"/a.cpp.o: /a.cpp /x.h\n", "/a.cpp", &["/a.cpp".into(), "/b.cpp".into()], &paths, &BTreeSet::from(["/x.h".into()])));
+        for bad in [b"broken" as &[u8], b"x: /a.cpp\\", b"x: /a.cpp\ny: /b.cpp", b"x: $(dynamic)"] { assert!(dependencies(bad).is_none()); }
+    }
+    #[test] fn corrupt_and_non_object_modules_are_rejected() {
+        let module = b"\0asm\x01\0\0\0";
+        assert!(!valid_object(module, &hash(module)));
+        assert!(!valid_object(b"not wasm", &hash(b"not wasm")));
+        let object = b"\0asm\x01\0\0\0\0\x09\x07linking\x02";
+        assert!(valid_object(object, &hash(object)));
+        assert!(!valid_object(object, &hash(b"different bytes")));
+        let corrupt = b"\0asm\x01\0\0\0\0\x09\x07linking\x03";
+        assert!(!valid_object(corrupt, &hash(corrupt)));
+    }
+}

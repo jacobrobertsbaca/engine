@@ -1,0 +1,13 @@
+[package]
+name = "engine-cpp-cache-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Exercise the production identity/validation code natively without the browser runtime.
+[lib]
+path = "../../src/worker/cpp_cache.rs"
+
+[dependencies]
+sha2 = "0.10.9"
+wasmparser = "0.245"

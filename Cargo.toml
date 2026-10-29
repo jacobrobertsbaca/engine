@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "tools/breakpoints"]
+members = [".", "tools/breakpoints", "tools/cpp-cache-tests"]
 
 [package]
 name = "engine"
@@ -44,5 +44,6 @@ gimli = { git = "https://github.com/gimli-rs/gimli" }
 wasm-encoder = { version = "0.245", features = ["wasmparser"] }
 wasmparser = "0.245"
 serde_json = "1.0.149"
+sha2 = "0.10.9"
 regex = "1.12.3"
 derive_more = { version = "2", features = ["display"] }

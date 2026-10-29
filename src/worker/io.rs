@@ -1,6 +1,7 @@
 use std::{
     io,
     pin::Pin,
+    sync::{Arc, atomic::{AtomicU64, Ordering}},
     task::{Context, Poll},
 };
 
@@ -174,11 +175,12 @@ impl VirtualFile for Stdin {
 #[derive(Debug)]
 pub struct Stdout {
     mode: StdoutMode,
+    byte_count: Option<Arc<AtomicU64>>,
 }
 
 impl Stdout {
-    pub fn new(mode: StdoutMode) -> Self {
-        Self { mode }
+    pub fn new_counted(mode: StdoutMode, byte_count: Arc<AtomicU64>) -> Self {
+        Self { mode, byte_count: Some(byte_count) }
     }
 }
 
@@ -188,6 +190,9 @@ impl AsyncWrite for Stdout {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Some(byte_count) = &self.byte_count {
+            byte_count.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        }
         WorkerOut::Stdout {
             data: buf,
             mode: self.mode,

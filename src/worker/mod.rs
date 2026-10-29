@@ -6,9 +6,10 @@ use wasm_bindgen::prelude::*;
 use wasmer_wasix::virtual_fs::{AsyncWriteExt, FileSystem, create_dir_all, mem_fs};
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
-use crate::types::{CppArtifacts, FsNode, Lang, WorkerOut, WorkerStart};
+use crate::types::{CppArtifacts, CppCacheBypass, CppCacheEntry, CppCacheRequest, CppCacheStats, FsNode, Lang, WorkerOut, WorkerStart};
 
 mod debuggee;
+mod cpp_cache;
 pub(crate) mod execution;
 pub(crate) mod host_device;
 mod io;
@@ -177,6 +178,9 @@ pub(crate) fn stop(exit_code: i32, build_start: Instant, run_start: Option<Insta
 }
 
 async fn start(msg: WorkerStart) {
+    if msg.build_only && msg.lang != Lang::C {
+        return WorkerOut::Error { message: "Compile-only preparation requires C/C++".into() }.send();
+    }
     if msg.lang != Lang::C && (msg.cpp_artifacts.is_some() || !msg.binary_files.is_empty()) {
         return WorkerOut::Error { message: "Binary build inputs require C/C++".into() }.send();
     }
@@ -209,6 +213,9 @@ async fn start_native(msg: WorkerStart) {
         }
     }
     sources.sort();
+    let hash_start = Instant::now();
+    let cache_inputs = msg.cpp_cache.as_ref().map(|_| cpp_cache_inputs(&msg.fs, &msg.binary_files, &sources));
+    let input_hash_ms = hash_start.elapsed().as_secs_f64() * 1000.0;
 
     let lang_name = match msg.lang {
         Lang::C => "C/C++",
@@ -243,7 +250,7 @@ async fn start_native(msg: WorkerStart) {
 
     match msg.lang {
         Lang::C => {
-            let host_device = match msg.host_device.map(HostDeviceFile::new).transpose() {
+            let host_device = match msg.host_device.filter(|_| !msg.build_only).map(HostDeviceFile::new).transpose() {
                 Ok(device) => device,
                 Err(error) => {
                     return WorkerOut::Error {
@@ -253,143 +260,254 @@ async fn start_native(msg: WorkerStart) {
                 }
             };
             let llvm = fetch_bytes(CPP_WASM_URL).await.expect("toolchain");
-            exec.write_bytes("/llvm.core.wasm", &llvm)
-                .await
-                .expect("toolchain");
-            start_cpp(is_debug, build_start, sources, exec, fs, host_device, artifacts).await;
+            start_cpp(is_debug, msg.build_only, build_start, sources, exec, fs, host_device, artifacts, msg.cpp_cache, cache_inputs, &llvm, input_hash_ms).await;
         }
         Lang::Rust => start_rust(is_debug, build_start, sources, exec, fs).await,
         Lang::Python => unreachable!(),
     }
 }
 
+fn cpp_cache_inputs(
+    fs: &std::collections::HashMap<String, FsNode>,
+    binaries: &std::collections::HashMap<String, serde_bytes::ByteBuf>,
+    sources: &[String],
+) -> cpp_cache::Inputs {
+    fn walk<'a>(node: &'a FsNode, path: String, files: &mut Vec<(String, &'a [u8], bool)>, paths: &mut Vec<String>) {
+        paths.push(path.clone());
+        match node {
+            FsNode::File(text) => files.push((path, text.as_bytes(), true)),
+            FsNode::Dir(children) => for (name, child) in children { walk(child, format!("{path}/{name}"), files, paths); },
+        }
+    }
+    let mut files = Vec::new();
+    let mut paths = Vec::new();
+    for (name, node) in fs { walk(node, format!("/{name}"), &mut files, &mut paths); }
+    for (path, bytes) in binaries {
+        paths.push(path.clone());
+        paths.extend(Path::new(path).ancestors().skip(1).filter(|path| *path != Path::new("/")).map(|path| path.to_string_lossy().into_owned()));
+        files.push((path.clone(), bytes.as_ref(), false));
+    }
+    cpp_cache::Inputs::new(files, paths, sources)
+}
+
+struct CppCacheJob {
+    generation: u32,
+    entries: std::collections::HashMap<String, CppCacheEntry>,
+    pending: Vec<CppCacheEntry>,
+    pending_bytes: usize,
+    stats: CppCacheStats,
+}
+
+impl CppCacheJob {
+    fn bypass(&mut self, source: &str, reason: &str) {
+        if self.stats.bypasses.len() < cpp_cache::MAX_REPORTED_SOURCES {
+            self.stats.bypasses.push(CppCacheBypass { source: source.chars().take(cpp_cache::MAX_SOURCE_PATH).collect(), reason: reason.into() });
+        }
+    }
+
+    fn send(self, publish: bool) {
+        if publish {
+            for entry in self.pending {
+                WorkerOut::CppCacheObject {
+                    generation: self.generation,
+                    source: entry.source,
+                    key: entry.key,
+                    object_hash: entry.object_hash,
+                    object: &entry.object,
+                }.send();
+            }
+        }
+        WorkerOut::CppCacheStats { generation: self.generation, stats: self.stats }.send();
+    }
+}
+
+fn cpp_clang_args(source: &str, is_debug: bool, artifacts: &CppArtifacts, depfile: bool) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-cc1", "-triple", "wasm32-wasip1", "-Werror", "-emit-obj", "-disable-free", "-isysroot", "/",
+        "-internal-isystem", "/include/c++/v1", "-internal-isystem", "/include", "-internal-isystem", "/include/wasm32-wasip1",
+        "-ferror-limit", "4", "-fcolor-diagnostics", "-x", "c++", "-std=c++23", "-fexceptions", "-fcxx-exceptions", "-exception-model=wasm",
+        "-target-feature", "+exception-handling", "-mllvm", "-wasm-enable-eh", "-mllvm", "-wasm-use-legacy-eh=true", "-o",
+    ].into_iter().map(String::from).collect();
+    args.push(format!("{source}.o"));
+    if is_debug { args.extend(["-O0", "-debug-info-kind=standalone", "-dwarf-version=5"].into_iter().map(String::from)); }
+    if let Some(pch) = &artifacts.precompiled_header { args.extend(["-include-pch".into(), pch.clone(), "-fvalidate-ast-input-files-content".into()]); }
+    if depfile { args.extend(["-dependency-file".into(), format!("{source}.o.d"), "-MT".into(), format!("{source}.o"), "-sys-header-deps".into()]); }
+    args.push(source.into());
+    args
+}
+
+fn cpp_link_args(sources: &[String], artifacts: &CppArtifacts) -> Vec<String> {
+    let mut args: Vec<String> = ["--export-dynamic", "-z", "stack-size=1048576", "-L/lib/wasm32-wasip1", "/lib/wasm32-wasip1/crt1.o"].into_iter().map(String::from).collect();
+    args.extend(sources.iter().map(|source| format!("{source}.o")));
+    args.extend(artifacts.archives.iter().flatten().cloned());
+    args.extend([
+        "/lib/wasm32-wasip1/cxa_exception.cpp.o", "/lib/wasm32-wasip1/cxa_personality.cpp.o", "-lc++", "-lc++abi", "-lunwind",
+        "/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a", "-lc", "-o", "/main.wasm",
+    ].into_iter().map(String::from));
+    args
+}
+
 async fn start_cpp(
     is_debug: bool,
+    build_only: bool,
     build_start: Instant,
     sources: Vec<String>,
     exec: Execution,
     fs: mem_fs::FileSystem,
     host_device: Option<HostDeviceFile>,
     artifacts: CppArtifacts,
+    request: Option<CppCacheRequest>,
+    inputs: Option<cpp_cache::Inputs>,
+    compiler_bytes: &[u8],
+    input_hash_ms: f64,
 ) {
-    // These three files add exception support without replacing the fetched sysroot.
-    let exceptions =
-        extract_tar_gz(include_bytes!("../../assets/cpp-exceptions/runtime.tar.gz").to_vec())
-            .await
-            .expect("embedded C++ exception runtime");
-    let exceptions: Arc<dyn FileSystem + Send + Sync> = Arc::new(exceptions);
+    // The identities below come from the exact bytes mounted for this job, never
+    // from a caller-supplied version, URL, length or timestamp.
+    let sysroot_bytes = fetch_bytes(CPP_STDLIB_URL).await.expect("C++ sysroot");
+    let hash_start = Instant::now();
+    let identities = request.as_ref().map(|_| (
+        cpp_cache::hash(compiler_bytes),
+        cpp_cache::hash(&sysroot_bytes),
+        cpp_cache::hash(include_bytes!("../../assets/cpp-exceptions/runtime.tar.gz")),
+    ));
+    let mut cache = request.map(|request| CppCacheJob {
+        generation: request.generation,
+        entries: request.entries.into_iter().take(cpp_cache::MAX_REPORTED_SOURCES).map(|entry| (entry.source.clone(), entry)).collect(),
+        pending: Vec::new(),
+        pending_bytes: 0,
+        stats: CppCacheStats { hash_ms: input_hash_ms + hash_start.elapsed().as_secs_f64() * 1000.0, ..Default::default() },
+    });
+    let sysroot: Arc<dyn FileSystem + Send + Sync> = Arc::new(extract_tar_gz(sysroot_bytes).await.expect("C++ sysroot filesystem"));
+    exec.fs.union(&sysroot);
+    // These files add exception support without replacing the fetched sysroot.
+    let exceptions: Arc<dyn FileSystem + Send + Sync> = Arc::new(
+        extract_tar_gz(include_bytes!("../../assets/cpp-exceptions/runtime.tar.gz").to_vec()).await.expect("embedded C++ exception runtime"),
+    );
     exec.fs.union(&exceptions);
-
-    let mut obj_paths: Vec<String> = Vec::with_capacity(sources.len());
-    let mut union_fs: Option<Box<dyn FileSystem>> = Some(Box::new(fs));
+    let user_fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(fs);
+    exec.fs.union(&user_fs);
+    // User resources cannot shadow the exact trusted compiler bytes identified
+    // above or enter the immutable compiler-module cache under its marker.
+    exec.write_bytes("/llvm.core.wasm", compiler_bytes).await.expect("toolchain");
+    let link_args = cpp_link_args(&sources, &artifacts);
 
     for source in &sources {
         let obj_path = format!("{source}.o");
-
-        let mut clang_args = vec![
-            "-cc1",
-            "-triple",
-            "wasm32-wasip1",
-            "-Werror",
-            "-emit-obj",
-            "-disable-free",
-            "-isysroot",
-            "/",
-            "-internal-isystem",
-            "/include/c++/v1",
-            "-internal-isystem",
-            "/include",
-            "-internal-isystem",
-            "/include/wasm32-wasip1",
-            "-ferror-limit",
-            "4",
-            "-fcolor-diagnostics",
-            "-x",
-            "c++",
-            "-std=c++23",
-            "-fexceptions",
-            "-fcxx-exceptions",
-            "-exception-model=wasm",
-            "-target-feature",
-            "+exception-handling",
-            "-mllvm",
-            "-wasm-enable-eh",
-            "-mllvm",
-            "-wasm-use-legacy-eh=true",
-            "-o",
-            obj_path.as_str(),
-        ];
-
-        if is_debug {
-            clang_args.push("-O0");
-            clang_args.push("-debug-info-kind=standalone");
-            clang_args.push("-dwarf-version=5");
+        let hash_start = Instant::now();
+        let bypass = if is_debug { Some("debug-profile") }
+            else if artifacts.precompiled_header.is_some() { Some("opaque-precompiled-header") }
+            else if cache.is_some() && exec.fs.metadata(Path::new(&format!("{source}.o.d"))).is_ok() { Some("dependency-path-collision") }
+            else { inputs.as_ref().and_then(|inputs| inputs.bypass(source)) };
+        let clang_args = cpp_clang_args(source, is_debug, &artifacts, cache.is_some() && bypass.is_none());
+        let key = if bypass.is_none() {
+            inputs.as_ref().zip(identities.as_ref()).and_then(|(inputs, (compiler, sysroot, exceptions))| inputs.key(source, compiler, sysroot, exceptions, &clang_args, &link_args))
+        } else { None };
+        if let Some(cache) = &mut cache { cache.stats.hash_ms += hash_start.elapsed().as_secs_f64() * 1000.0; }
+        let lookup_start = Instant::now();
+        let mut cached = false;
+        if let Some(cache) = &mut cache {
+            if let Some(reason) = bypass { cache.bypass(source, reason); }
+            else if let Some(key) = &key {
+                if let Some(entry) = cache.entries.remove(source) {
+                    if entry.key == *key {
+                        if entry.object.len() <= 128 * 1024 * 1024 && cpp_cache::valid_object(&entry.object, &entry.object_hash) {
+                            // write_bytes creates a fresh owned copy in this job's fresh fs.
+                            cached = exec.write_bytes(&obj_path, &entry.object).await.is_ok();
+                        }
+                        if !cached && cache.stats.invalid_sources.len() < cpp_cache::MAX_REPORTED_SOURCES { cache.stats.invalid_sources.push(source.clone()); }
+                    }
+                }
+                if cached {
+                    cache.stats.hits += 1;
+                    if cache.stats.hit_sources.len() < cpp_cache::MAX_REPORTED_SOURCES { cache.stats.hit_sources.push(source.clone()); }
+                } else { cache.stats.misses += 1; }
+            } else { cache.bypass(source, "unsupported-input"); }
+            cache.stats.lookup_ms += lookup_start.elapsed().as_secs_f64() * 1000.0;
         }
-
-        if let Some(pch) = &artifacts.precompiled_header {
-            clang_args.extend(["-include-pch", pch, "-fvalidate-ast-input-files-content"]);
-        }
-        clang_args.push(source);
-
-        let mut step = exec
-            .step("clang")
-            .binary("/llvm.core.wasm")
-            .args(&clang_args);
-        if let Some(fs) = union_fs.take() {
-            step = step.sysroot(CPP_STDLIB_URL).fs(fs);
-        }
-        let exit = step.run().await.expect("Compilation succeeded");
-
+        // A hit is counted only here, when the clang step is actually omitted.
+        if cached { continue; }
+        let output_before = exec.output_bytes();
+        let compile_start = Instant::now();
+        let exit = exec.step("clang").binary("/llvm.core.wasm").compiler().args(&clang_args).run().await.expect("Compilation succeeded");
+        if let Some(cache) = &mut cache { cache.stats.compile_ms += compile_start.elapsed().as_secs_f64() * 1000.0; }
+        // Dependency receipts are compiler-private. They must never appear in
+        // the student filesystem or differ between cache misses and hits.
+        let depfile = if key.is_some() {
+            let dep_path = format!("{source}.o.d");
+            let bytes = exec.read_bytes(&dep_path).await;
+            let _ = exec.fs.remove_file(Path::new(&dep_path));
+            if exec.fs.metadata(Path::new(&dep_path)).is_ok() {
+                if let Some(cache) = cache { cache.send(false); }
+                return WorkerOut::Error { message: "Cannot remove compiler dependency receipt".into() }.send();
+            }
+            Some(bytes)
+        } else { None };
         if !exit.is_success() {
+            if let Some(cache) = cache { cache.send(false); }
             return stop(exit.raw(), build_start, None).send();
         }
-        obj_paths.push(obj_path);
+        if let Some(cache) = &mut cache {
+            if let Some(key) = key {
+                if exec.output_bytes() != output_before { cache.bypass(source, "compiler-diagnostics"); continue; }
+                let depfile = depfile.expect("eligible compile has dependency receipt result");
+                if !depfile.as_ref().ok().zip(inputs.as_ref()).is_some_and(|(depfile, inputs)| cpp_cache::dependencies_valid(depfile, source, &sources, &inputs.user_paths, &inputs.opaque_paths)) {
+                    cache.bypass(source, "unsupported-dependencies"); continue;
+                }
+                if let Some(reason) = inputs.as_ref().and_then(|inputs| inputs.dependency_bypass(depfile.as_ref().unwrap())) {
+                    cache.bypass(source, reason); continue;
+                }
+                let mut volatile_dependency = false;
+                let mut system_headers = Vec::new();
+                let mut user_headers = Vec::new();
+                for dependency in cpp_cache::dependencies(depfile.as_ref().unwrap()).unwrap().into_iter()
+                    .map(|path| cpp_cache::normalized_dependency(&path).expect("validated canonical dependency")) {
+                    if inputs.as_ref().is_some_and(|inputs| !inputs.user_paths.contains(&dependency)) {
+                        match exec.read_bytes(&dependency).await {
+                            Ok(bytes) if !cpp_cache::volatile_macro(&bytes) => system_headers.push(bytes),
+                            _ => { volatile_dependency = true; break; },
+                        }
+                    } else {
+                        match exec.read_bytes(&dependency).await {
+                            Ok(bytes) => user_headers.push(bytes),
+                            _ => { volatile_dependency = true; break; },
+                        }
+                    }
+                }
+                if volatile_dependency { cache.bypass(source, "volatile-system-header"); continue; }
+                let Some(tainted) = cpp_cache::trusted_macro_taint(&system_headers) else { cache.bypass(source, "unsupported-system-macros"); continue; };
+                if user_headers.iter().any(|bytes| cpp_cache::references_tainted_macro(bytes, &tainted)) {
+                    cache.bypass(source, "dynamic-system-macro"); continue;
+                }
+                let Ok(object) = exec.read_bytes(&obj_path).await else { cache.bypass(source, "missing-object"); continue; };
+                let object_hash = cpp_cache::hash(&object);
+                if !cpp_cache::valid_object(&object, &object_hash) { cache.bypass(source, "invalid-object"); continue; }
+                if cache.pending.len() >= 256 || object.len() > 128 * 1024 * 1024 - cache.pending_bytes {
+                    cache.bypass(source, "staging-budget"); continue;
+                }
+                cache.pending_bytes += object.len();
+                cache.pending.push(CppCacheEntry { source: source.clone(), key, object_hash, object: object.into() });
+            }
+        }
     }
 
-    let mut link_args: Vec<&str> = vec![
-        "--export-dynamic",
-        "-z",
-        "stack-size=1048576",
-        "-L/lib/wasm32-wasip1",
-        "/lib/wasm32-wasip1/crt1.o",
-    ];
-    for obj in &obj_paths {
-        link_args.push(obj);
+    // Preparation stops before linking, student instantiation or host devices.
+    if build_only {
+        if let Some(cache) = cache { cache.send(true); }
+        return stop(0, build_start, None).send();
     }
-    for archive in artifacts.archives.iter().flatten() {
-        link_args.push(archive);
-    }
-    link_args.extend_from_slice(&[
-        "/lib/wasm32-wasip1/cxa_exception.cpp.o",
-        "/lib/wasm32-wasip1/cxa_personality.cpp.o",
-        "-lc++",
-        "-lc++abi",
-        "-lunwind",
-        "/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a",
-        "-lc",
-        "-o",
-        "/main.wasm",
-    ]);
-
-    let exit = exec
-        .step("wasm-ld")
-        .binary("/llvm.core.wasm")
-        .args(&link_args)
-        .run()
-        .await
-        .expect("Linking succeeded");
-
+    let link_start = Instant::now();
+    let exit = exec.step("wasm-ld").binary("/llvm.core.wasm").compiler().args(&link_args).run().await.expect("Linking succeeded");
+    if let Some(cache) = &mut cache { cache.stats.link_ms = link_start.elapsed().as_secs_f64() * 1000.0; }
     if !exit.is_success() {
+        if let Some(cache) = cache { cache.send(false); }
         return stop(exit.raw(), build_start, None).send();
     }
 
     let run_start = Instant::now();
     let mut run = exec.step("main").binary("/main.wasm").debug(is_debug);
-    if let Some(device) = host_device {
-        run = run.device_file(HOST_DEVICE_PATH, Box::new(device));
-    }
+    if let Some(device) = host_device { run = run.device_file(HOST_DEVICE_PATH, Box::new(device)); }
     let exit = run.run().await.expect("Running succeeded");
-
+    if let Some(cache) = cache { cache.send(exit.is_success()); }
     stop(exit.raw(), build_start, Some(run_start)).send();
 }
 

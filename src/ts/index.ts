@@ -3,212 +3,427 @@ import EventEmitter from 'events';
 import { prefetch_urls, WorkerOut, WorkerStart } from '../../pkg/engine';
 import init from '../../pkg/engine';
 import wasmBinary from '../../pkg/engine_bg.wasm';
+import type {
+  CompilerModuleMessage,
+  CompilerModuleStats,
+  RetainedCompilerModule
+} from './compiler-module-cache';
+import { CppCacheLimits, CppObjectCache, ObjectCacheStats } from './cpp-object-cache';
 import { Debugger } from './debugger';
+import { createEngineWorker } from './engine-worker';
 import { HostDeviceOpener, HostDeviceSession } from './host-device';
 import { errorResult, Internals } from './util';
-import RustWorker from './worker?worker&inline';
 
-// Concurrent Engine.create calls must share wasm-bindgen's initialization.
 let initialization: ReturnType<typeof init> | undefined;
-
 export type Lang = 'c' | 'python' | 'rust';
 type StdoutMode = 1 | 2;
 
-/** Optional inputs produced by the same C++ toolchain as this engine. */
 export interface CppArtifacts {
   sources?: string[] | null;
   archives?: string[] | null;
   precompiledHeader?: string | null;
 }
 
-/** Wall-clock timing for a run, in milliseconds. */
-export type Timing = {
-  /** Host time including worker startup and teardown. */
-  totalMs: number;
-  /** Worker time fetching, compiling, and linking before execution. */
-  buildMs: number;
-  /** Worker time for the user program execution step only. */
-  runMs: number;
-};
+/** Immutable ownership boundary. Create a new Engine when either identity changes. */
+export interface EngineScope {
+  projectId: string;
+  accountId: string;
+}
+export interface CppPerformanceOptions {
+  scope: EngineScope;
+  objectCache?: boolean | Partial<CppCacheLimits>;
+  retainWorker?: boolean;
+  cacheCompilerModule?: boolean;
+  /** Idle worker lifetime; defaults to 30 seconds, at most five minutes. */
+  idleTimeoutMs?: number;
+}
+export interface EngineOptions {
+  cpp?: CppPerformanceOptions;
+}
+export type { CppCacheLimits, ObjectCacheStats } from './cpp-object-cache';
 
-/** The engine ran to completion with the provided `exitCode`. */
+export type Timing = { totalMs: number; buildMs: number; runMs: number };
 export type CompletedResult = { type: 'completed'; exitCode: number; timing: Timing };
-/** The engine was stopped by calling `stop`. */
 export type StoppedResult = { type: 'stopped' };
-/** The engine had an error. This is an error with the engine itself, and not the user's code. */
 export type ErrorResult = { type: 'error'; error: { type: string; message: string } };
-/** The result of calling {@link Engine.run} */
 export type RunResult = CompletedResult | StoppedResult | ErrorResult;
-
 export type FsNode = string | DirNode;
 export type DirNode = { [name: string]: FsNode };
+
+/** Bounded, source-free compilation measurements from one worker job. */
+export interface CppTranslationUnitStatistics {
+  hits: number;
+  misses: number;
+  bypasses: Array<{ source: string; reason: string }>;
+  hit_sources: string[];
+  invalid_sources: string[];
+  hash_ms: number;
+  lookup_ms: number;
+  compile_ms: number;
+  link_ms: number;
+}
+export interface CppJobStatistics {
+  operation: 'compile' | 'run';
+  workerReadyMs: number;
+  workerReused: boolean;
+  cache?: CppTranslationUnitStatistics;
+  compilerModule?: CompilerModuleStats;
+}
+export interface CppCacheStatistics extends ObjectCacheStats {
+  generation: number;
+  workerRetained: boolean;
+  workerRetirements: number;
+  compilerModuleIdentityBytes: number;
+  latest?: CppJobStatistics;
+}
+
+type InternalMessage = WorkerOut | CompilerModuleMessage;
+interface Job {
+  generation: number;
+  settled: boolean;
+  buildOnly: boolean;
+  debug: boolean;
+  start: WorkerStart;
+  opener?: HostDeviceOpener;
+  device?: HostDeviceSession;
+  startedAt: number;
+  stats: CppJobStatistics;
+  staged: CppObjectCache;
+  resolve: (result: RunResult) => void;
+}
+interface WorkerSlot {
+  worker: Worker;
+  ready: boolean;
+  remove: () => void;
+}
 
 export class Engine {
   public readonly stdout = new Stdout(1);
   public readonly stderr = new Stdout(2);
   public readonly stdin = new Stdin();
   public readonly debugger: Debugger;
-
-  /** A function which, when called, rejects the ongoing execution */
-  private rejector?: () => void;
-
-  /** The ongoing `run` promise, if any */
-  private promise?: Promise<RunResult>;
-  private runActive = false;
-
-  /**
-   * The programming language of this engine.
-   */
   public readonly lang: Lang;
-
-  /**
-   * The *initial* filesystem that the code sees.
-   *
-   * This is neither updated while the code is running, nor
-   * will updating it have any effect on code that is already running.
-   */
+  public readonly scope?: Readonly<EngineScope>;
   public fs: DirNode = {};
-
-  /** Optional binary build inputs, addressed by absolute virtual paths. */
   public binaryFiles: Record<string, Uint8Array> = {};
   public cppArtifacts?: CppArtifacts;
-
-  /** Optional C/C++ and Python byte device. The opener is captured once at the start of each run. */
   public hostDevice?: HostDeviceOpener;
 
-  static async create(lang: Lang): Promise<Engine> {
+  private readonly options?: Readonly<CppPerformanceOptions>;
+  private readonly objects: CppObjectCache;
+  private generation = 0;
+  private disposed = false;
+  private active?: Job;
+  private promise?: Promise<RunResult>;
+  private slot?: WorkerSlot;
+  private idleTimer?: ReturnType<typeof setTimeout>;
+  private compilerModule?: RetainedCompilerModule;
+  private retirements = 0;
+  private latest?: CppJobStatistics;
+
+  static async create(lang: Lang, options: EngineOptions = {}): Promise<Engine> {
+    const capturedOptions = structuredClone(options);
     initialization ??= init({ module_or_path: wasmBinary }).catch((error: unknown) => {
       initialization = undefined;
       throw error;
     });
     await initialization;
+    const engine = new Engine(lang, capturedOptions);
     if (typeof window !== 'undefined' && typeof fetch !== 'undefined')
-      // Drain prefetches so an unread response cannot hold the browser cache entry open.
       for (const url of prefetch_urls(lang))
         void fetch(url, { cache: 'force-cache' })
           .then((response) => response.arrayBuffer())
           .catch(() => {});
-    return new Engine(lang);
+    return engine;
   }
 
-  private constructor(lang: Lang) {
+  private constructor(lang: Lang, options: EngineOptions) {
+    const cpp = options.cpp;
+    if (cpp) {
+      if (lang !== 'c') throw new TypeError('C++ performance options require C/C++');
+      if (!cpp.scope?.projectId || !cpp.scope.accountId)
+        throw new TypeError('C++ performance options require project and account identity');
+      const idleTimeoutMs = cpp.idleTimeoutMs ?? 30_000;
+      if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs < 1 || idleTimeoutMs > 300_000)
+        throw new RangeError('Compiler idle timeout must be between 1 and 300000 milliseconds');
+      this.scope = Object.freeze({ ...cpp.scope });
+      this.options = Object.freeze({ ...cpp, scope: this.scope, idleTimeoutMs });
+    }
+    this.objects = new CppObjectCache(typeof cpp?.objectCache === 'object' ? cpp.objectCache : {});
     this.debugger = new Debugger();
     this.lang = lang;
   }
 
-  /**
-   * Stops the currently running execution.
-   */
-  public stop(): void {
-    this.rejector?.();
+  public get cacheStats(): CppCacheStatistics {
+    return structuredClone({
+      ...this.objects.stats(),
+      generation: this.generation,
+      workerRetained: !!this.slot && !this.active,
+      workerRetirements: this.retirements,
+      compilerModuleIdentityBytes: this.compilerModule?.bytes.byteLength ?? 0,
+      latest: this.latest
+    });
   }
 
-  /**
-   * Runs the program. {@link CompletedResult} carries build/run timing: `timing.runMs`
-   * is the isolated user-program execution step, `timing.buildMs` covers toolchain fetch,
-   * compile, and link, and `timing.totalMs` adds host-side worker startup and teardown.
-   */
-  public async run(): Promise<RunResult> {
-    if (this.promise) return this.promise;
-    if (this.runActive) throw new Error('Run setup is already active');
-    this.runActive = true;
-    this.promise = this.execute();
+  /** Clears all retained code/objects. An active job may finish but cannot repopulate them. */
+  public clearCaches(): void {
+    this.generation++;
+    this.objects.clear();
+    this.active?.staged.clear();
+    this.compilerModule = undefined;
+    if (!this.active) this.retireWorker();
+  }
+
+  /** Stops synchronously, drops retained resources, and resolves after job cleanup. */
+  public stop(): Promise<void> {
+    this.clearCaches();
+    const drain = this.promise;
+    this.retireWorker();
+    if (this.active) this.finish(this.active, { type: 'stopped' });
+    return drain ? drain.then(() => {}) : Promise.resolve();
+  }
+
+  /** Required on project/account replacement and teardown. This Engine cannot be reused. */
+  public async dispose(): Promise<void> {
+    this.disposed = true;
+    await this.stop();
+  }
+
+  /** Every Run links current objects and starts a fresh student runtime. */
+  public run(): Promise<RunResult> {
+    return this.submit(false);
+  }
+
+  /** Compiles Run-profile C++ translation units only; never links, runs, or opens devices. */
+  public compile(): Promise<RunResult> {
+    return this.submit(true);
+  }
+
+  private submit(buildOnly: boolean): Promise<RunResult> {
+    if (this.disposed) return Promise.resolve(errorResult(new Error('Engine is disposed')));
+    if (this.active)
+      return Promise.resolve(errorResult(new Error('An engine job is already active')));
+    if (buildOnly && this.lang !== 'c')
+      return Promise.resolve(errorResult(new Error('Compile-only is supported for C/C++')));
+    let snapshot: Pick<WorkerStart, 'fs' | 'binary_files' | 'cpp_artifacts'>;
     try {
-      return await this.promise;
-    } finally {
-      this.promise = undefined;
-      this.runActive = false;
+      snapshot = {
+        fs: structuredClone(this.fs),
+        binary_files: Object.fromEntries(
+          Object.entries(this.binaryFiles).map(([path, bytes]) => [path, bytes.slice()])
+        ),
+        cpp_artifacts: structuredClone(this.cppArtifacts) ?? null
+      };
+    } catch (error) {
+      return Promise.resolve(errorResult(error));
     }
+    const debug = !buildOnly && this.debugger.enabled;
+    const opener = buildOnly ? undefined : this.hostDevice;
+    if (
+      opener !== undefined &&
+      (typeof opener !== 'function' || !['c', 'python'].includes(this.lang))
+    )
+      return Promise.resolve(errorResult(new TypeError('Invalid host device configuration')));
+    clearTimeout(this.idleTimer);
+    if (debug) {
+      this.retireWorker();
+      this.compilerModule = undefined;
+    }
+    this.stdin[Internals].clear();
+    const reused = !!this.slot;
+    let resolve!: (value: RunResult) => void;
+    const promise = new Promise<RunResult>((done) => {
+      resolve = done;
+    });
+    this.promise = promise;
+    const job: Job = {
+      generation: this.generation,
+      settled: false,
+      buildOnly,
+      debug,
+      opener,
+      startedAt: performance.now(),
+      resolve,
+      staged: new CppObjectCache(this.objects.limits),
+      stats: { operation: buildOnly ? 'compile' : 'run', workerReadyMs: 0, workerReused: reused },
+      start: {
+        ...snapshot,
+        lang: this.lang,
+        is_debug: debug,
+        build_only: buildOnly,
+        stdin_buffer: this.stdin[Internals].buffer,
+        cpp_cache:
+          this.options?.objectCache && !debug
+            ? { generation: this.generation, entries: this.objects.snapshot() }
+            : null
+      }
+    };
+    this.active = job;
+    try {
+      if (!this.slot) this.makeWorker();
+      if (!this.current(job)) return promise;
+      if (this.slot!.ready) this.dispatch(job);
+    } catch (error) {
+      this.finish(job, errorResult(error));
+    }
+    return promise;
   }
 
-  private async execute(): Promise<RunResult> {
-    const totalStart = performance.now();
-    const opener = this.hostDevice;
-    const binaryFiles = structuredClone(this.binaryFiles);
-    const cppArtifacts = structuredClone(this.cppArtifacts);
-    let worker: Worker | undefined;
-    let device: HostDeviceSession | undefined;
-    let removeListeners: (() => void) | undefined;
-    let cleanupError: Error | undefined;
-    let result: RunResult;
-    try {
-      if (opener !== undefined) {
-        if (this.lang !== 'c' && this.lang !== 'python')
-          throw new TypeError('Host devices are supported only for C/C++ and Python execution');
-        if (typeof opener !== 'function') throw new TypeError('hostDevice must be a function');
-      }
-      result = await new Promise<RunResult>((resolve, reject) => {
-        this.rejector = () => reject('stopped');
-        worker = new RustWorker();
-        const currentWorker = worker;
-        this.stdout[Internals].attach(worker);
-        this.stderr[Internals].attach(worker);
-        this.debugger[Internals].attach(worker);
-        let ready = false;
-        const onError = (event: ErrorEvent) =>
-          reject(event.error ?? new Error(event.message || 'Execution worker failed'));
-        const onMessageError = () =>
-          reject(new Error('Execution worker emitted an unreadable message'));
-        const onMessage = (event: MessageEvent<WorkerOut>) => {
-          const message = event.data;
+  private current(job: Job): boolean {
+    return this.active === job && !job.settled;
+  }
+
+  private makeWorker(): void {
+    const worker = createEngineWorker();
+    const slot: WorkerSlot = { worker, ready: false, remove: () => {} };
+    this.slot = slot;
+    const onMessage = (event: MessageEvent<InternalMessage>) => {
+      if (this.slot !== slot) return;
+      const message = event.data;
+      const job = this.active;
+      if (message.type === 'ready') {
+        if (slot.ready) return;
+        slot.ready = true;
+        if (job && this.current(job)) {
           try {
-            if (message.type === 'ready' && !ready) {
-              ready = true;
-              const start: WorkerStart = {
-                fs: this.fs,
-                binary_files: binaryFiles,
-                cpp_artifacts: cppArtifacts ?? null,
-                lang: this.lang,
-                stdin_buffer: this.stdin[Internals].buffer,
-                is_debug: this.debugger.enabled,
-                ...(device ? { host_device: device.workerStart } : {})
-              };
-              currentWorker.postMessage(start);
-            } else if (message.type === 'stop') {
-              resolve({
-                type: 'completed',
-                exitCode: message.exit_code,
-                timing: {
-                  totalMs: performance.now() - totalStart,
-                  buildMs: message.build_ms,
-                  runMs: message.run_ms
-                }
-              });
-            } else if (message.type === 'error') {
-              resolve({ type: 'error', error: { type: 'EngineError', message: message.message } });
-            }
+            this.dispatch(job);
           } catch (error) {
-            reject(error);
+            this.finish(job, errorResult(error));
           }
-        };
-        worker.addEventListener('message', onMessage);
-        worker.addEventListener('error', onError);
-        worker.addEventListener('messageerror', onMessageError);
-        removeListeners = () => {
-          currentWorker.removeEventListener('message', onMessage);
-          currentWorker.removeEventListener('error', onError);
-          currentWorker.removeEventListener('messageerror', onMessageError);
-        };
-        if (opener !== undefined) {
-          device = new HostDeviceSession(reject);
-          device.attach(worker);
-          device.open(opener);
         }
-      });
-    } catch (err: unknown) {
-      result = err === 'stopped' ? { type: 'stopped' } : errorResult(err);
-    } finally {
-      this.rejector = undefined;
-      removeListeners?.();
-      cleanupError = device?.close();
-      if (worker) {
-        this.stdout[Internals].detach(worker);
-        this.stderr[Internals].detach(worker);
-        this.stdin[Internals].clear();
-        worker.terminate();
+        return;
       }
+      if (!job || !this.current(job)) return;
+      try {
+        if (message.type === 'stop') {
+          this.finish(job, {
+            type: 'completed',
+            exitCode: message.exit_code,
+            timing: {
+              totalMs: performance.now() - job.startedAt,
+              buildMs: message.build_ms,
+              runMs: message.run_ms
+            }
+          });
+        } else if (message.type === 'error') {
+          this.finish(job, errorResult(new Error(message.message)));
+        } else if (
+          message.type === 'cpp_cache_object' &&
+          message.generation === this.generation &&
+          job.generation === this.generation
+        ) {
+          job.staged.put(message);
+        } else if (message.type === 'cpp_cache_stats' && message.generation === job.generation) {
+          job.stats.cache = message.stats;
+        } else if (
+          message.type === 'compiler_module' &&
+          job.generation === this.generation &&
+          this.options?.cacheCompilerModule &&
+          !job.debug
+        ) {
+          this.compilerModule = message.value;
+        } else if (message.type === 'compiler_module_stats') {
+          job.stats.compilerModule = message;
+        }
+      } catch (error) {
+        this.finish(job, errorResult(error));
+      }
+    };
+    const onError = (event: ErrorEvent) => {
+      if (this.slot !== slot) return;
+      if (this.active)
+        this.finish(this.active, errorResult(event.error ?? new Error(event.message)));
+      else {
+        this.retireWorker();
+        this.compilerModule = undefined;
+      }
+    };
+    const onMessageError = () =>
+      onError({ message: 'Unreadable execution worker message' } as ErrorEvent);
+    // DAP must observe completion before central cleanup retires a Debug worker.
+    this.debugger[Internals].attach(worker);
+    worker.addEventListener('message', onMessage);
+    worker.addEventListener('error', onError);
+    worker.addEventListener('messageerror', onMessageError);
+    slot.remove = () => {
+      worker.removeEventListener('message', onMessage);
+      worker.removeEventListener('error', onError);
+      worker.removeEventListener('messageerror', onMessageError);
+      this.debugger[Internals].detach(worker);
+    };
+  }
+
+  private dispatch(job: Job): void {
+    if (!this.current(job) || !this.slot) return;
+    const worker = this.slot.worker;
+    job.stats.workerReadyMs = performance.now() - job.startedAt;
+    this.stdout[Internals].attach(worker);
+    this.stderr[Internals].attach(worker);
+    this.debugger[Internals].beginRun();
+    if (job.opener) {
+      job.device = new HostDeviceSession((error) => this.finish(job, errorResult(error)));
+      job.device.attach(worker);
+      job.device.open(job.opener);
+      // Device openers are observable user callbacks and may synchronously Stop/dispose.
+      if (!this.current(job)) return;
+      job.start.host_device = job.device.workerStart;
     }
-    return cleanupError ? errorResult(cleanupError) : result;
+    const cacheCompilerModule = !!this.options?.cacheCompilerModule && !job.debug;
+    worker.postMessage({
+      type: 'configure_cpp',
+      cacheCompilerModule,
+      compilerModule: cacheCompilerModule ? this.compilerModule : undefined
+    });
+    if (this.current(job)) worker.postMessage(job.start);
+  }
+
+  private finish(job: Job, result: RunResult): void {
+    if (!this.current(job)) return;
+    // Fence before cleanup or any observable callback can dispatch queued-ready work.
+    job.settled = true;
+    const worker = this.slot?.worker;
+    if (worker) {
+      this.stdout[Internals].detach(worker);
+      this.stderr[Internals].detach(worker);
+    }
+    const cleanupError = job.device?.close();
+    if (cleanupError) result = errorResult(cleanupError);
+    const healthy =
+      result.type === 'completed' &&
+      result.exitCode === 0 &&
+      !job.debug &&
+      job.generation === this.generation &&
+      !this.disposed;
+    if (job.generation === this.generation)
+      for (const source of job.stats.cache?.invalid_sources ?? []) this.objects.delete(source);
+    if (healthy) {
+      for (const source of job.stats.cache?.hit_sources ?? []) this.objects.touch(source);
+      for (const entry of job.staged.snapshot()) this.objects.put(entry);
+    }
+    this.latest = job.stats;
+    this.stdin[Internals].clear();
+    if (!healthy || !this.options?.retainWorker || this.lang !== 'c') this.retireWorker();
+    if (healthy && (this.options?.retainWorker || this.options?.cacheCompilerModule))
+      this.idleTimer = setTimeout(() => {
+        this.retireWorker();
+        this.compilerModule = undefined;
+      }, this.options.idleTimeoutMs);
+    if (!healthy) this.compilerModule = undefined;
+    this.active = undefined;
+    this.promise = undefined;
+    job.resolve(result);
+  }
+
+  private retireWorker(): void {
+    clearTimeout(this.idleTimer);
+    const slot = this.slot;
+    if (!slot) return;
+    this.slot = undefined;
+    slot.remove();
+    this.stdout[Internals].detach(slot.worker);
+    this.stderr[Internals].detach(slot.worker);
+    slot.worker.terminate();
+    this.retirements++;
   }
 }
 
@@ -260,9 +475,10 @@ export class Stdin {
   private static readonly WRITE_IDX = 1;
   private static encoder = new TextEncoder();
 
-  private readonly buffer = new SharedArrayBuffer(Stdin.BUFFER_SIZE);
-  private readonly indices: Int32Array;
-  private readonly data: Int8Array;
+  private buffer = new SharedArrayBuffer(Stdin.BUFFER_SIZE);
+  private generation = 0;
+  private indices: Int32Array;
+  private data: Int8Array;
 
   [Internals]: {
     clear(): void;
@@ -272,14 +488,21 @@ export class Stdin {
   constructor() {
     this.indices = new Int32Array(this.buffer, 0, 2);
     this.data = new Int8Array(this.buffer, Stdin.HEADER_SIZE);
+    const getBuffer = () => this.buffer;
     this[Internals] = {
       clear: this.clear.bind(this),
-      buffer: this.buffer
+      get buffer() {
+        return getBuffer();
+      }
     };
   }
 
   private clear() {
-    this.indices.fill(0);
+    this.generation++;
+    Atomics.notify(this.indices, Stdin.READ_IDX);
+    this.buffer = new SharedArrayBuffer(Stdin.BUFFER_SIZE);
+    this.indices = new Int32Array(this.buffer, 0, 2);
+    this.data = new Int8Array(this.buffer, Stdin.HEADER_SIZE);
   }
 
   public async write(value: Uint8Array | string): Promise<void> {
@@ -290,8 +513,9 @@ export class Stdin {
   private async writeBytes(chunk: Uint8Array): Promise<void> {
     const { DATA_SIZE, READ_IDX, WRITE_IDX } = Stdin;
     let offset = 0;
+    const generation = this.generation;
 
-    while (offset < chunk.length) {
+    while (offset < chunk.length && generation === this.generation) {
       const readIdx = Atomics.load(this.indices, READ_IDX);
       let writeIdx = Atomics.load(this.indices, WRITE_IDX);
 
