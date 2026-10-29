@@ -1,0 +1,631 @@
+// libc++ deque elements, block crossings, paging, nested and invalid values.
+{
+  "steps": [
+    {
+      "type": "request",
+      "command": "setBreakpoints",
+      "arguments": {
+        "source": {
+          "path": "main.cpp"
+        },
+        "breakpoints": [
+          {
+            "line": 34
+          }
+        ]
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "breakpoints": {
+          "$array.contains": [
+            {
+              "line": 34,
+              "verified": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "request",
+      "command": "configurationDone",
+      "arguments": {}
+    },
+    {
+      "type": "event",
+      "event": "stopped",
+      "body": {
+        "reason": "breakpoint"
+      },
+      "$timeout": 30000
+    },
+    {
+      "type": "request",
+      "command": "stackTrace",
+      "arguments": {
+        "threadId": 1
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "stackFrames": {
+          "$array.contains": [
+            {
+              "name": "main",
+              "id": "${{frame}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "request",
+      "command": "scopes",
+      "arguments": {
+        "frameId": "{{frame}}"
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "scopes": {
+          "$array.contains": [
+            {
+              "name": "Locals",
+              "variablesReference": "${{locals}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{locals}}"
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": "${{values}}"
+      }
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'empty').indexedVariables",
+      "expect": 0
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'drained').indexedVariables",
+      "expect": 0
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'one').indexedVariables",
+      "expect": 1
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'numbers').indexedVariables",
+      "expect": 1029
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'bits').indexedVariables",
+      "expect": 4099
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'words').indexedVariables",
+      "expect": 2
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'nested').indexedVariables",
+      "expect": 2
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'large').indexedVariables",
+      "expect": 18
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'pointers').indexedVariables",
+      "expect": 3
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'empty').variablesReference",
+      "expect": 0
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'drained').variablesReference",
+      "expect": 0
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'unreadable').value.startsWith('<error:')",
+      "expect": true
+    },
+    {
+      "type": "expect",
+      "run": "values.find(v => v.name === 'corrupt').value.startsWith('<error:')",
+      "expect": true
+    },
+    {
+      "type": "expect",
+      "run": "'indexedVariables' in values.find(v => v.name === 'unreadable')",
+      "expect": false
+    },
+    {
+      "type": "expect",
+      "run": "'indexedVariables' in values.find(v => v.name === 'corrupt')",
+      "expect": false
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'one').variablesReference}}",
+        "filter": "indexed",
+        "start": 0,
+        "count": 1
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "name": "[0]",
+            "value": "5"
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'numbers').variablesReference}}",
+        "filter": "indexed",
+        "start": 0,
+        "count": 3
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "name": "[0]",
+            "value": "7"
+          },
+          {
+            "name": "[1]",
+            "value": "2"
+          },
+          {
+            "name": "[2]",
+            "value": "3"
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'numbers').variablesReference}}",
+        "filter": "indexed",
+        "start": 99,
+        "count": 1
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "name": "[99]",
+            "value": "100"
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'numbers').variablesReference}}",
+        "filter": "indexed",
+        "start": 100,
+        "count": 1
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "name": "[100]",
+            "value": "101"
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'numbers').variablesReference}}",
+        "filter": "indexed",
+        "start": 101,
+        "count": 1
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "name": "[101]",
+            "value": "102"
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'numbers').variablesReference}}",
+        "filter": "indexed",
+        "start": 1022,
+        "count": 4
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "name": "[1022]",
+            "value": "1023"
+          },
+          {
+            "name": "[1023]",
+            "value": "1024"
+          },
+          {
+            "name": "[1024]",
+            "value": "1025"
+          },
+          {
+            "name": "[1025]",
+            "value": "1026"
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'numbers').variablesReference}}",
+        "filter": "indexed",
+        "start": 1027,
+        "count": 10
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "name": "[1027]",
+            "value": "1028"
+          },
+          {
+            "name": "[1028]",
+            "value": "1029"
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'numbers').variablesReference}}",
+        "filter": "indexed",
+        "start": 1029,
+        "count": 1
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": []
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'numbers').variablesReference}}",
+        "filter": "indexed",
+        "start": 5000,
+        "count": 3
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": []
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'bits').variablesReference}}",
+        "filter": "indexed",
+        "start": 4093,
+        "count": 5
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "name": "[4093]",
+            "value": "false"
+          },
+          {
+            "name": "[4094]",
+            "value": "true"
+          },
+          {
+            "name": "[4095]",
+            "value": "false"
+          },
+          {
+            "name": "[4096]",
+            "value": "false"
+          },
+          {
+            "name": "[4097]",
+            "value": "false"
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'words').variablesReference}}",
+        "filter": "indexed",
+        "start": 0,
+        "count": 5
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "name": "[0]",
+            "value": "\"second\""
+          },
+          {
+            "name": "[1]",
+            "value": "\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'nested').variablesReference}}",
+        "filter": "indexed",
+        "start": 0,
+        "count": 2
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": "${{nested}}"
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{nested[0].variablesReference}}",
+        "filter": "indexed",
+        "start": 0,
+        "count": 10
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "name": "[0]",
+            "value": "1"
+          },
+          {
+            "name": "[1]",
+            "value": "2"
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'large').variablesReference}}",
+        "filter": "indexed",
+        "start": 15,
+        "count": 3
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": "${{large}}"
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{large[1].variablesReference}}",
+        "filter": "named",
+        "start": 0,
+        "count": 1
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "name": "value",
+            "value": "42"
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'pointers').variablesReference}}",
+        "filter": "indexed",
+        "start": 0,
+        "count": 3
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": "${{pointers}}"
+      }
+    },
+    {
+      "type": "expect",
+      "run": "pointers[1].value",
+      "expect": "0x0"
+    },
+    {
+      "type": "expect",
+      "run": "pointers[2].value",
+      "expect": "0xfffffff0"
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{pointers[2].variablesReference}}"
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "value": "<unavailable>"
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{pointers[0].variablesReference}}"
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": [
+          {
+            "value": "37"
+          }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": {
+        "variablesReference": "{{values.find(v => v.name === 'numbers').variablesReference}}",
+        "filter": "named",
+        "start": 0,
+        "count": 100
+      }
+    },
+    {
+      "type": "response",
+      "success": true,
+      "body": {
+        "variables": []
+      }
+    },
+    {
+      "type": "request",
+      "command": "continue",
+      "arguments": {
+        "threadId": 1
+      }
+    },
+    {
+      "type": "event",
+      "event": "runResult",
+      "body": {
+        "type": "completed",
+        "exitCode": 0
+      },
+      "$timeout": 10000
+    }
+  ]
+}

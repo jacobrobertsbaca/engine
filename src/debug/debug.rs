@@ -86,6 +86,7 @@ impl Debugger {
                             Rc::new(formatters::cpp::StdStringFormatter),
                             Rc::new(formatters::cpp::StdMapFormatter),
                             Rc::new(formatters::cpp::StdVectorFormatter),
+                            Rc::new(formatters::cpp::StdDequeFormatter),
                         ],
                     },
                     FormatterCategory {
