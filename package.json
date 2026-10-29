@@ -1,6 +1,6 @@
 {
   "name": "debugger-sh",
-  "version": "0.3.15-webide.0.8.1.1",
+  "version": "0.3.15-webide.0.8.1.2",
   "description": "A browser-based execution engine and debugger powered by WebAssembly (WebIDE fork build; not an upstream npm release)",
   "keywords": [
     "wasm",
@@ -48,9 +48,11 @@
       "prettier --write"
     ]
   },
+  "dependencies": {
+    "@types/node": "22.13.1"
+  },
   "devDependencies": {
     "@trivago/prettier-plugin-sort-imports": "^6.0.2",
-    "@types/node": "^22.13.1",
     "eslint": "^9.39.2",
     "events": "^3.3.0",
     "husky": "^9.1.7",

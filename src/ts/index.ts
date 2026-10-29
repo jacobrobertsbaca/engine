@@ -1,3 +1,4 @@
+/// <reference types="node" preserve="true" />
 import EventEmitter from 'events';
 
 import { prefetch_urls, WorkerOut, WorkerStart } from '../../pkg/engine';
@@ -210,7 +211,7 @@ export class Engine {
       snapshot = {
         fs: structuredClone(this.fs),
         binary_files: Object.fromEntries(
-          Object.entries(this.binaryFiles).map(([path, bytes]) => [path, bytes.slice()])
+          Object.entries(this.binaryFiles).map(([path, bytes]) => [path, new Uint8Array(bytes)])
         ),
         cpp_artifacts: structuredClone(this.cppArtifacts) ?? null
       };
