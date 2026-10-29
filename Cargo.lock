@@ -731,6 +731,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "serde_repr",
+ "sha2",
  "tar",
  "tsify",
  "wasm-bindgen",
@@ -741,6 +742,14 @@ dependencies = [
  "wasmer-wasix",
  "wasmparser 0.245.1",
  "web-sys",
+]
+
+[[package]]
+name = "engine-cpp-cache-tests"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "wasmparser 0.245.1",
 ]
 
 [[package]]

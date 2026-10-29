@@ -41,6 +41,8 @@ export class Debugger extends EventEmitter<DebuggerEventMap> {
    */
   [Internals]: {
     attach(worker: Worker): void;
+    detach(worker: Worker): void;
+    beginRun(): void;
   };
 
   private readonly dap: DapAdapter;
@@ -65,7 +67,9 @@ export class Debugger extends EventEmitter<DebuggerEventMap> {
   constructor() {
     super();
     this[Internals] = {
-      attach: this.attach.bind(this)
+      attach: this.attach.bind(this),
+      detach: this.detach.bind(this),
+      beginRun: () => this.dap.resetRun()
     };
 
     this.onMessage = this.onMessage.bind(this);
@@ -78,13 +82,20 @@ export class Debugger extends EventEmitter<DebuggerEventMap> {
     return this.dap.sendMessage(message);
   }
 
+  private readonly artifactListener = (event: MessageEvent<WorkerOut>) => {
+    if (event.data.type !== 'artifact') return;
+    const artifact = new Artifact(event.data.name, new Uint8Array(event.data.data));
+    this.emit('artifact', artifact);
+  };
+
   private attach(worker: Worker) {
-    worker.addEventListener('message', (event: MessageEvent<WorkerOut>) => {
-      if (event.data.type !== 'artifact') return;
-      const artifact = new Artifact(event.data.name, new Uint8Array(event.data.data));
-      this.emit('artifact', artifact);
-    });
+    worker.addEventListener('message', this.artifactListener);
     this.dap.attach(worker);
+  }
+
+  private detach(worker: Worker) {
+    worker.removeEventListener('message', this.artifactListener);
+    this.dap.detach();
   }
 
   private onMessage(message: unknown) {
