@@ -425,38 +425,39 @@ impl EvaluationContext {
         let encoding = die.ctx().unit.encoding();
         let mut eval = expr.evaluation(encoding);
 
+        let mut result = eval.evaluate()?;
         loop {
-            let result = eval.evaluate()?;
-            match result {
+            result = match result {
                 gimli::EvaluationResult::Complete => return Ok(eval.result()),
-                gimli::EvaluationResult::RequiresWasmLocal { index } => {
-                    eval.resume_with_wasm_value(
+                gimli::EvaluationResult::RequiresWasmLocal { index } => eval
+                    .resume_with_wasm_value(
                         self.wasm_value(func, &WasmLocation::Local(index as usize))?,
-                    )?;
-                }
-                gimli::EvaluationResult::RequiresWasmStack { index } => {
-                    eval.resume_with_wasm_value(
+                    )?,
+                gimli::EvaluationResult::RequiresWasmStack { index } => eval
+                    .resume_with_wasm_value(
                         self.wasm_value(func, &WasmLocation::Operand(index as usize))?,
-                    )?;
-                }
-                gimli::EvaluationResult::RequiresWasmGlobal { index } => {
-                    eval.resume_with_wasm_value(
+                    )?,
+                gimli::EvaluationResult::RequiresWasmGlobal { index } => eval
+                    .resume_with_wasm_value(
                         self.wasm_value(func, &WasmLocation::Operand(index as usize))?,
-                    )?;
-                }
+                    )?,
                 gimli::EvaluationResult::RequiresFrameBase => {
-                    if let Some(fb) = self.fb.get() {
-                        eval.resume_with_frame_base(*fb)?;
+                    let fb = if let Some(&fb) = self.fb.get() {
+                        fb
                     } else {
                         let expr = die
                             .expression(gimli::DW_AT_frame_base, pc)
                             .context("Required DW_AT_frame_base missing on function")?;
                         let fb = self.evaluate_unsigned(expr)?;
-                        eval.resume_with_frame_base(*self.fb.get_or_init(|| fb))?;
-                    }
+                        *self.fb.get_or_init(|| fb)
+                    };
+                    eval.resume_with_frame_base(fb)?
                 }
-                _ => anyhow::bail!("Could not execute evaluation step {result:?}"),
-            }
+                gimli::EvaluationResult::RequiresRelocatedAddress(address) => {
+                    eval.resume_with_relocated_address(address)?
+                }
+                other => anyhow::bail!("Could not execute evaluation step {other:?}"),
+            };
         }
     }
 
