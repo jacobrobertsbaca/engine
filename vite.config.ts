@@ -70,12 +70,13 @@ function wasm(): PluginOption {
       // In dev mode, we serve compiled Rust .wasm files from a local dev server
       if (devPort) return `export default new URL("http://localhost:${devPort}/${wasmFile}");`;
 
-      // In release mode, prefer a same-origin asset path when set (Cloudflare
-      // Workers static assets). Absolute paths resolve against import.meta.url's
-      // origin, which works for real http(s) worker scripts (not data: inlines).
+      // Same-origin asset path for Cloudflare static deploys. Use a plain
+      // string (not `new URL(..., import.meta.url)`) so Next/webpack does not
+      // try to resolve `/engine_bg.wasm` at build time. Requires a real
+      // http(s) worker script — not `?worker&inline` data: URLs.
       const sameOriginWasm = process.env.WASM_ASSET_PATH;
       if (isRelease && sameOriginWasm) {
-        return `export default new URL(${JSON.stringify(sameOriginWasm)}, import.meta.url);`;
+        return `export default ${JSON.stringify(sameOriginWasm)};`;
       }
 
       // Otherwise serve .wasm files from the npm registry via CDN
