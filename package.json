@@ -1,6 +1,6 @@
 {
   "name": "debugger-sh",
-  "version": "0.3.15-webide.0.8.1.5",
+  "version": "0.3.15-webide.0.8.1.6",
   "description": "A browser-based execution engine and debugger powered by WebAssembly (WebIDE fork build; not an upstream npm release)",
   "keywords": [
     "wasm",
