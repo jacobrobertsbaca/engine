@@ -166,12 +166,16 @@ impl Instrumenter {
             dwarf,
         } = self.info;
 
+        // We only preserve functions here that were instrumented
+        // i.e. their debug stack frame has a non-zero size
+        let functions = self.functions.into_iter().filter(|f| f.size > 0).collect();
+
         DebugInfo {
             breakpoints: js_sys::SharedArrayBuffer::new(
                 (BP_PREFIX_BYTES + self.locations.len()) as u32,
             ),
             locations: self.locations,
-            functions: self.functions,
+            functions,
             memory,
             stack,
             dwarf,
