@@ -326,7 +326,8 @@ fn cpp_clang_args(source: &str, is_debug: bool, artifacts: &CppArtifacts, depfil
         "-cc1", "-triple", "wasm32-wasip1", "-Werror", "-emit-obj", "-disable-free", "-isysroot", "/",
         "-internal-isystem", "/include/c++/v1", "-internal-isystem", "/include", "-internal-isystem", "/include/wasm32-wasip1",
         "-ferror-limit", "4", "-fcolor-diagnostics", "-x", "c++", "-std=c++23", "-fexceptions", "-fcxx-exceptions", "-exception-model=wasm",
-        "-target-feature", "+exception-handling", "-mllvm", "-wasm-enable-eh", "-mllvm", "-wasm-use-legacy-eh=true", "-o",
+        "-target-feature", "+exception-handling", "-mllvm", "-wasm-enable-eh", "-mllvm", "-wasm-use-legacy-eh=true",
+        "-fsanitize=null", "-fno-sanitize-recover=null", "-o",
     ].into_iter().map(String::from).collect();
     args.push(format!("{source}.o"));
     if is_debug { args.extend(["-O0", "-debug-info-kind=standalone", "-dwarf-version=5"].into_iter().map(String::from)); }
@@ -341,7 +342,8 @@ fn cpp_link_args(sources: &[String], artifacts: &CppArtifacts) -> Vec<String> {
     args.extend(sources.iter().map(|source| format!("{source}.o")));
     args.extend(artifacts.archives.iter().flatten().cloned());
     args.extend([
-        "/lib/wasm32-wasip1/cxa_exception.cpp.o", "/lib/wasm32-wasip1/cxa_personality.cpp.o", "-lc++", "-lc++abi", "-lunwind",
+        "/lib/wasm32-wasip1/cxa_exception.cpp.o", "/lib/wasm32-wasip1/cxa_personality.cpp.o",
+        "/lib/wasm32-wasip1/ubsan.cpp.o", "-lc++", "-lc++abi", "-lunwind",
         "/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a", "-lc", "-o", "/main.wasm",
     ].into_iter().map(String::from));
     args
@@ -368,7 +370,11 @@ async fn start_cpp(
     let identities = request.as_ref().map(|_| (
         cpp_cache::hash(compiler_bytes),
         cpp_cache::hash(&sysroot_bytes),
-        cpp_cache::hash(include_bytes!("../../assets/cpp-exceptions/runtime.tar.gz")),
+        // Exception runtime + UBSan stub share the "supplement" identity.
+        cpp_cache::hash(&[
+            include_bytes!("../../assets/cpp-exceptions/runtime.tar.gz").as_slice(),
+            include_bytes!("../../assets/ubsan/ubsan.cpp.o").as_slice(),
+        ].concat()),
     ));
     let mut cache = request.map(|request| CppCacheJob {
         generation: request.generation,
@@ -389,6 +395,9 @@ async fn start_cpp(
     // User resources cannot shadow the exact trusted compiler bytes identified
     // above or enter the immutable compiler-module cache under its marker.
     exec.write_bytes("/llvm.core.wasm", compiler_bytes).await.expect("toolchain");
+    exec.write_bytes("/lib/wasm32-wasip1/ubsan.cpp.o", include_bytes!("../../assets/ubsan/ubsan.cpp.o"))
+        .await
+        .expect("UBSan stub");
     let link_args = cpp_link_args(&sources, &artifacts);
 
     for source in &sources {
