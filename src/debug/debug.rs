@@ -439,7 +439,7 @@ impl EvaluationContext {
                     )?,
                 gimli::EvaluationResult::RequiresWasmGlobal { index } => eval
                     .resume_with_wasm_value(
-                        self.wasm_value(func, &WasmLocation::Operand(index as usize))?,
+                        self.wasm_value(func, &WasmLocation::Global(index as usize))?,
                     )?,
                 gimli::EvaluationResult::RequiresFrameBase => {
                     let fb = if let Some(&fb) = self.fb.get() {
@@ -455,6 +455,27 @@ impl EvaluationContext {
                 }
                 gimli::EvaluationResult::RequiresRelocatedAddress(address) => {
                     eval.resume_with_relocated_address(address)?
+                }
+                gimli::EvaluationResult::RequiresMemory {
+                    address,
+                    size,
+                    space: _,
+                    base_type: _,
+                } => {
+                    let debugger = self
+                        .debugger
+                        .as_deref()
+                        .context("Cannot read memory without debugger")?;
+                    let size = usize::from(size);
+                    anyhow::ensure!(
+                        (1..=8).contains(&size),
+                        "Unsupported DWARF memory read size {size}"
+                    );
+                    let bytes = debugger.memory().read(address.into(), size);
+                    let mut raw = [0u8; 8];
+                    raw[..size].copy_from_slice(&bytes[..size]);
+                    let value = u64::from_le_bytes(raw);
+                    eval.resume_with_memory(gimli::Value::Generic(value))?
                 }
                 other => anyhow::bail!("Could not execute evaluation step {other:?}"),
             };
