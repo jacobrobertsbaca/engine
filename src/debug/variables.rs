@@ -52,8 +52,8 @@ pub fn get_variables<'a>(die: &Die<'a>, pc: CodeOffset) -> Vec<Die<'a>> {
             }
 
             _ => {
-                if let Some((low, high)) = child.addr_range() {
-                    if pc < low || pc >= high {
+                if let Some(ranges) = child.ranges() {
+                    if !ranges.contains(pc) {
                         return Visit::SkipChildren;
                     }
                 }

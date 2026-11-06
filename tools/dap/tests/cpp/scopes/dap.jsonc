@@ -1,0 +1,135 @@
+{
+  "steps": [
+    {
+      "type": "request",
+      "command": "setBreakpoints",
+      "arguments": {
+        "source": { "path": "main.cpp" },
+        "breakpoints": [{ "line": 3 }, { "line": 5 }]
+      }
+    },
+    {
+      "type": "response",
+      "body": {
+        "breakpoints": {
+          "$array.contains": [
+            { "line": 3, "verified": true },
+            { "line": 5, "verified": true }
+          ]
+        }
+      }
+    },
+    {
+      "type": "request",
+      "command": "configurationDone",
+      "arguments": {}
+    },
+    {
+      "type": "event",
+      "event": "stopped",
+      "body": {
+        "reason": "breakpoint",
+        "threadId": "${{thread}}"
+      }
+    },
+    {
+      "type": "request",
+      "command": "stackTrace",
+      "arguments": { "threadId": "{{thread}}" }
+    },
+    {
+      "type": "response",
+      "body": {
+        "stackFrames": {
+          "$array.contains": [{ "id": "${{frame}}", "name": "getSample", "line": 3 }]
+        }
+      }
+    },
+    {
+      "type": "request",
+      "command": "scopes",
+      "arguments": { "frameId": "{{frame}}" }
+    },
+    {
+      "type": "response",
+      "body": {
+        "scopes": {
+          "$array.contains": [
+            { "name": "Locals", "variablesReference": "${{locals}}" }
+          ]
+        }
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": { "variablesReference": "{{locals}}" }
+    },
+    {
+      "type": "response",
+      "body": {
+        "variables": [{ "name": "list", "type": "int" }]
+      }
+    },
+    {
+      "type": "request",
+      "command": "continue",
+      "arguments": { "threadId": "{{thread}}" }
+    },
+    {
+      "type": "event",
+      "event": "stopped",
+      "body": {
+        "reason": "breakpoint",
+        "threadId": "{{thread}}"
+      }
+    },
+    {
+      "type": "request",
+      "command": "stackTrace",
+      "arguments": { "threadId": "{{thread}}" }
+    },
+    {
+      "type": "response",
+      "body": {
+        "stackFrames": {
+          "$array.contains": [{ "id": "${{loopFrame}}", "name": "getSample", "line": 5 }]
+        }
+      }
+    },
+    {
+      "type": "request",
+      "command": "scopes",
+      "arguments": { "frameId": "{{loopFrame}}" }
+    },
+    {
+      "type": "response",
+      "body": {
+        "scopes": {
+          "$array.contains": [
+            { "name": "Locals", "variablesReference": "${{loopLocals}}" }
+          ]
+        }
+      }
+    },
+    {
+      "type": "request",
+      "command": "variables",
+      "arguments": { "variablesReference": "{{loopLocals}}" }
+    },
+    {
+      "type": "response",
+      "body": {
+        "variables": [
+          { "name": "list", "type": "int" },
+          { "name": "i", "type": "int" }
+        ]
+      }
+    },
+    {
+      "type": "request",
+      "command": "continue",
+      "arguments": { "threadId": "{{thread}}" }
+    }
+  ]
+}

@@ -81,7 +81,7 @@ fn parse_debug_functions(dwarf: &Dwarf) -> Vec<DebugFunction> {
                     return Visit::Continue;
                 }
 
-                let Some((low_pc, high_pc)) = child.addr_range() else {
+                let Some((low_pc, high_pc)) = child.ranges().and_then(|r| r.single()) else {
                     return Visit::Continue;
                 };
 

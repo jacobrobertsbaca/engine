@@ -62,12 +62,20 @@ impl DieRanges {
         !self.0.iter().any(|(begin, end)| end > begin)
     }
 
-    pub fn single(&self) -> Option<&DieRange> {
-        if self.0.len() != 1 {
-            return None;
+    /// Returns the sole range, or [`None`] if there are zero or more than one.
+    pub fn single(&self) -> Option<DieRange> {
+        match self.0.as_slice() {
+            &[range] => Some(range),
+            _ => None,
         }
+    }
 
-        self.0.get(0)
+    /// Returns whether `pc` falls in any of these ranges.
+    pub fn contains(&self, pc: CodeOffset) -> bool {
+        let addr = u64::from(pc);
+        self.0
+            .iter()
+            .any(|(begin, end)| addr >= u64::from(*begin) && addr < u64::from(*end))
     }
 }
 
@@ -178,19 +186,21 @@ impl<'a> Die<'a> {
         }
     }
 
-    pub fn addr_range(&self) -> Option<(CodeOffset, CodeOffset)> {
-        let low_pc = self.attr(gimli::DW_AT_low_pc)?;
-        let low_pc = weak_error!(self.ctx().unit_ref().attr_address(low_pc.value())).flatten()?;
-        let low_pc = low_pc.into();
-
-        let high_pc = self.attr(gimli::DW_AT_high_pc)?;
-        if let Some(offset) = high_pc.udata_value() {
-            return Some((low_pc, (u64::from(low_pc) + offset).into()));
+    /// Returns the code address ranges of this DIE, if any.
+    pub fn ranges(&self) -> Option<DieRanges> {
+        let unit = self.ctx().unit_ref();
+        let mut iter = weak_error!(unit.die_ranges(self.die()))?;
+        let mut ranges = Vec::new();
+        while let Some(range) = weak_error!(iter.next())? {
+            if range.end > range.begin {
+                ranges.push((range.begin.into(), range.end.into()));
+            }
         }
-
-        let high_pc = weak_error!(self.ctx().unit_ref().attr_address(high_pc.value())).flatten()?;
-        let high_pc = high_pc.into();
-        return Some((low_pc, high_pc));
+        if ranges.is_empty() {
+            None
+        } else {
+            Some(DieRanges(ranges))
+        }
     }
 
     /// Gets an attribute as a [DieReference], if possible.
